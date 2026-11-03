@@ -1,0 +1,9 @@
+tool_group,dispatch_rule
+CLEAN,
+CVD,
+PHOTO,
+ETCH,
+IMPLANT,
+FURNACE,
+CMP,
+INSPECT,

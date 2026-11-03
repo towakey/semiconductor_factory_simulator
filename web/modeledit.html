@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>モデル設定編集 - 半導体工場シミュレーター</title>
+<link rel="stylesheet" href="viewer.css">
+<style>
+#meTabs button.on { background:#39507a; }
+#meTable { overflow:auto; max-height:60vh; border:1px solid #333; margin:6px 0; }
+#meTable table { border-collapse:collapse; font-size:12px; }
+#meTable th { position:sticky; top:0; background:#2c3340; padding:4px 6px;
+  border:1px solid #333; white-space:nowrap; z-index:1; }
+#meTable td { border:1px solid #2c3340; padding:0; }
+#meTable td input, #meTable td select { border:0; background:transparent;
+  color:#e8e8e8; padding:4px; width:100%; font-size:12px; }
+#meTable td.err { background:#5a1f1f; }
+#meTable td input:focus, #meTable td select:focus { background:#1f2a3a; }
+#meTable select option { color:#000; }
+#meErrs div { cursor:pointer; padding:1px 4px; }
+#meErrs div:hover { background:#334; }
+#meErrs div.w { color:#fd8; }
+.rowbtns button { font-size:11px; padding:1px 4px; margin:0 1px; }
+#meSimHint { font-size:11px; color:#9ab; margin:2px 0; }
+</style>
+</head>
+<body>
+<header id="toolbar">
+  <a href="index.html" style="color:#8fd">← ビューアー</a>
+  <label>モデル <select id="meModel"></select></label>
+  <button id="meClone">複製…</button>
+  <button id="meSave">保存*</button>
+  <button id="meDiscard">破棄</button>
+  <button id="meValidate">検証</button>
+  <button id="meUndo">元に戻す</button>
+  <button id="meRedo">やり直し</button>
+  <span id="meStatus">-</span>
+</header>
+<div id="meNote" class="edbar">注意: 保存すると CSV の # コメント行と空行は失われます。保存前に自動で既存ファイルを履歴(model_history)に退避します。</div>
+<div id="meTabs" class="edbar"></div>
+<div id="meSubTabs" class="edbar"></div>
+<div id="meTable"></div>
+<div class="edbar"><b>検証結果</b> <span id="meVStatus"></span></div>
+<div id="meErrs" class="edbar" style="display:block;max-height:150px;overflow-y:auto"></div>
+<script src="modeledit.js?v=20261102g"></script>
+</body>
+</html>

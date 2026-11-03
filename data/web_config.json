@@ -1,0 +1,8 @@
+{
+  "run_mode": "spawn",
+  "max_concurrent": 2,
+  "layout_editors": [],
+  "allow_anonymous_edit": true,
+  "disk_free_min_mb": 100,
+  "duration_max": 525600
+}

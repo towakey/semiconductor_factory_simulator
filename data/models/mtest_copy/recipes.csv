@@ -1,0 +1,13 @@
+recipe,tool_group,process_time,time_unit,dist,dist_param,batch_min,batch_max,batch_wait_max
+R_CLN1,CLEAN,77.5,lot,fixed,,,,
+R_CLN2,CLEAN,30,lot,fixed,,,,
+R_FURN1,FURNACE,240,lot,fixed,,2,4,120
+R_CVD1,CVD,50,lot,triangular,45;60,,,
+R_CVD2,CVD,65,lot,fixed,,,,
+R_PHOTO1,PHOTO,45,lot,fixed,,,,
+R_PHOTO2,PHOTO,55,lot,fixed,,,,
+R_ETCH1,ETCH,2,wafer,triangular,1.8;2.4,,,
+R_ETCH2,ETCH,60,lot,fixed,,,,
+R_IMP1,IMPLANT,70,lot,fixed,,,,
+R_CMP1,CMP,40,lot,fixed,,,,
+R_INSP,INSPECT,15,lot,fixed,,,,

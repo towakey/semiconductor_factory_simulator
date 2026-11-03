@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+out/
+data/runs/*
+!data/runs/.gitkeep
+data/api_error.log
+.layout.lock
+.model.lock
+layout_history/
+model_history/
