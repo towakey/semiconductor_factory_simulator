@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>シミュレーション結果</title>
-<link rel="stylesheet" href="results.css?v=20261103c">
+<link rel="stylesheet" href="results.css?v=20261103h">
 </head>
 <body>
 <header>
@@ -43,6 +43,47 @@
 </nav>
 <main>
   <section id="summary"></section>
+  <details id="chartSection" open>
+    <summary>推移グラフ</summary>
+    <div class="chart-controls">
+      <label>指標
+        <select id="chartMetric">
+          <option value="wip">WIP(合計)</option>
+          <option value="wip_wait">WIP(待ち)</option>
+          <option value="wip_equip">WIP(設備上)</option>
+          <option value="utilization">稼働率(BUSY/(P−PM−DOWN))</option>
+          <option value="utilization_gross">稼働率(BUSY/P)</option>
+          <option value="completed_steps">完了工程数</option>
+          <option value="avg_process_time">平均処理時間</option>
+          <option value="avg_wait">平均ディスパッチ待ち</option>
+          <option value="state_time">状態時間</option>
+          <option value="completed_lots">完了ロット数(全体)</option>
+          <option value="avg_cycle_time">平均サイクルタイム(全体)</option>
+          <option value="on_time_rate">納期遵守率(全体)</option>
+        </select>
+      </label>
+      <label>対象 <select id="chartScope">
+        <option value="total">全体</option>
+        <option value="group">装置グループ</option>
+        <option value="equip">装置</option>
+      </select></label>
+      <label>刻み <select id="chartStep">
+        <option value="60">1時間</option><option value="360">6時間</option>
+        <option value="1440">24時間</option><option value="custom">任意</option>
+      </select></label>
+      <label>分 <input id="chartStepCustom" type="number" min="1" value="60" disabled></label>
+      <label><input type="radio" name="chartMode" value="bucket" checked> バケット毎</label>
+      <label><input type="radio" name="chartMode" value="cum"> 累積</label>
+      <button id="chartAddTotal">全体を系列に追加</button>
+      <button id="chartCsv">グラフCSV</button>
+      <small id="chartHint">行をクリックして系列を追加/削除(最大6)。WIP は各時点の瞬時値。</small>
+    </div>
+    <div id="chartLegend"></div>
+    <div id="chartWrap">
+      <canvas id="chartCanvas" aria-label="時系列推移グラフ"></canvas>
+      <div id="chartTooltip" hidden></div>
+    </div>
+  </details>
   <section id="filters" hidden>
     <label>グループ <select id="groupFilter"><option value="">すべて</option></select></label>
     <label>エリア <select id="areaFilter"><option value="">すべて</option></select></label>
@@ -51,6 +92,7 @@
     <table id="table"><thead></thead><tbody></tbody></table>
   </section>
 </main>
-<script src="results.js?v=20261103c"></script>
+<script src="results-chart.js?v=20261103h"></script>
+<script src="results.js?v=20261103h"></script>
 </body>
 </html>

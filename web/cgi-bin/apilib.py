@@ -31,7 +31,8 @@ BAD_CHARS = re.compile(r"[/\\\x00]|\.\.")
 MAX_WINDOW = 4320.0        # 3日分
 MAX_ROWS = 50000
 GET_ACTIONS = {"models", "runs", "status", "layout", "window", "kpi",
-               "summary", "results", "model_layout", "model_files"}
+               "summary", "results", "results_series", "model_layout",
+               "model_files"}
 POST_ACTIONS = {"start", "cancel", "layout_lock", "layout_unlock",
                 "layout_save", "layout_auto", "model_validate",
                 "model_lock", "model_unlock", "model_save", "model_clone"}
@@ -869,6 +870,409 @@ def _results(params):
         db.close()
 
 
+def _results_series(params):
+    run = params.get("run", "")
+    metric = params.get("metric", "")
+    scope = params.get("scope", "total")
+    mode = params.get("mode", "bucket")
+    if not _valid_run(run):
+        return _err(400, "bad_run")
+    metrics = {"wip", "wip_wait", "wip_equip", "utilization",
+               "utilization_gross", "completed_steps", "avg_process_time",
+               "avg_wait", "state_time", "completed_lots", "avg_cycle_time",
+               "on_time_rate"}
+    if metric not in metrics or scope not in ("total", "group", "equip") \
+            or mode not in ("bucket", "cum"):
+        return _err(400, "bad_params")
+    try:
+        step = float(params.get("step", 60))
+    except (TypeError, ValueError):
+        return _err(400, "bad_step")
+    if not math.isfinite(step) or step < 1:
+        return _err(400, "bad_step")
+    raw_ids = params.get("ids", "")
+    ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
+    if len(ids) > 6:
+        return _err(400, "too_many_ids")
+    db = _db(run)
+    if db is None:
+        return _err(404, "no_db")
+    try:
+        meta = _meta(db)
+        job = _job(_run_dir(run))
+        duration = _f(meta.get("duration"), _f(job.get("duration")))
+        status = meta.get("status", job.get("status", "unknown"))
+        progress = _f(meta.get("progress_time"))
+        try:
+            with open(os.path.join(_run_dir(run), "progress.json"),
+                      encoding="utf-8") as f:
+                progress = max(progress,
+                               _f(json.load(f).get("progress_time")))
+        except (OSError, ValueError):
+            pass
+        upper = min(duration, progress) if status in ("running", "queued") \
+            else duration
+        if scope == "total":
+            if ids not in ([], ["total"]):
+                return _err(400, "bad_id")
+            ids = ["total"]
+        elif metric == "state_time":
+            if len(ids) != 1:
+                return _err(400, "bad_id")
+        elif not ids:
+            return _err(400, "bad_id")
+        if metric in ("completed_lots", "avg_cycle_time", "on_time_rate") \
+                and scope != "total":
+            return _err(400, "bad_scope")
+        need_wip = metric in ("wip", "wip_wait", "wip_equip")
+        need_steps = metric in ("wip", "wip_wait", "wip_equip",
+                                "completed_steps", "avg_process_time",
+                                "avg_wait")
+        need_state = metric in ("state_time", "utilization",
+                                "utilization_gross")
+        need_recipe_group = (scope == "group" and metric in
+                             ("wip", "wip_wait", "completed_steps",
+                              "avg_process_time", "avg_wait"))
+
+        equips = {}
+        for r in db.execute(
+                "SELECT equip_id,tool_group FROM equipments ORDER BY equip_id"):
+            equips[r[0]] = r[1]
+        recipe_tg = {}
+        try:
+            recipe_tg = dict(db.execute(
+                "SELECT recipe,tool_group FROM recipes"))
+        except sqlite3.Error:
+            pass
+        if not recipe_tg:
+            path = os.path.join(_run_dir(run), "config", "recipes.csv")
+            try:
+                with open(path, encoding="utf-8-sig", newline="") as f:
+                    raw = [r for r in csv.reader(f)
+                           if r and not r[0].strip().startswith("#")]
+                if raw:
+                    ir, ig = raw[0].index("recipe"), raw[0].index("tool_group")
+                    recipe_tg = {r[ir]: r[ig] for r in raw[1:]
+                                 if len(r) > max(ir, ig)}
+            except (OSError, ValueError, IndexError):
+                pass
+        groups = set(recipe_tg.values()) | set(equips.values())
+        if scope == "group" and any(x not in groups for x in ids):
+            return _err(400, "bad_id")
+        if scope == "equip" and any(x not in equips for x in ids):
+            return _err(400, "bad_id")
+        if metric == "state_time" and scope == "total" and \
+                ids != ["total"]:
+            return _err(400, "bad_id")
+
+        warnings = []
+        if need_recipe_group and not recipe_tg:
+            warnings.append(
+                "この run にレシピ→ツールグループ対応表がないため、"
+                "グループ別系列を算出できません。")
+            return 200, {"ok": True, "step": step, "times": [],
+                         "series": [], "unit": "分", "warnings": warnings}
+
+        if metric == "state_time":
+            series_ids = ["BUSY", "IDLE", "SETUP", "DOWN", "PM"]
+            labels = dict((x, x) for x in series_ids)
+        else:
+            series_ids = list(ids)
+            labels = {"total": "全体"}
+            labels.update((x, x) for x in ids if x != "total")
+
+        if upper > 0 and math.ceil(upper / step) + 1 > 500:
+            step = upper / 499.0
+        if upper <= 0:
+            times = [0.0]
+        else:
+            count = int(math.ceil(upper / step))
+            times = [0.0] + [min(upper, i * step)
+                              for i in range(1, count)]
+            if times[-1] < upper:
+                times.append(upper)
+
+        # Build event deltas once; then sweep all sample points.
+        count_events = {}
+        sum_events = {}
+        avg_events = {}
+
+        def add_event(target, key, at, value, include_zero=False):
+            if at is None or at < 0 or (at == 0 and not include_zero) \
+                    or at > upper:
+                return
+            target.setdefault(key, []).append((float(at), value))
+
+        def entity_for(s):
+            if scope == "total":
+                return "total"
+            if scope == "equip":
+                return s[3] if s[3] in equips else None
+            return recipe_tg.get(s[2])
+
+        # Read lots once; only materialize interval data for relevant metric.
+        lot_rows = db.execute(
+            "SELECT lot_id,release_time,due_date,complete_time"
+            " FROM lots").fetchall()
+        lots = {r[0]: r for r in lot_rows}
+        for lot_id, release, due, complete in lot_rows:
+            if metric == "wip" and release is not None:
+                add_event(count_events, ("wip_total", "total"),
+                          release, 1, True)
+            if metric == "wip" and complete is not None:
+                add_event(count_events, ("wip_total", "total"),
+                          complete, -1, True)
+            if metric == "completed_lots":
+                add_event(count_events, ("completed_lots", "total"),
+                          complete, 1)
+            if metric in ("avg_cycle_time", "on_time_rate"):
+                if complete is not None and release is not None:
+                    if metric == "avg_cycle_time":
+                        add_event(sum_events, ("cycle", "total"),
+                                  complete, complete - release)
+                        add_event(avg_events, ("cycle", "total"), complete, 1)
+                    elif due is not None:
+                        add_event(count_events, ("due", "total"), complete, 1)
+                        if complete <= due:
+                            add_event(count_events, ("ontime", "total"),
+                                      complete, 1)
+
+        # Steps are fetched once. Final duration-closes for unfinished current
+        # steps are sentinels, not completed process records.
+        step_rows = db.execute(
+            "SELECT lot_id,seq,recipe,equip_id,t_stocker_in,t_reserved,"
+            "t_start,t_end FROM lot_steps WHERE t_stocker_in<=? OR"
+            " t_reserved<=? OR t_start<=? OR t_end<=?",
+            (upper, upper, upper, upper)).fetchall() if need_steps else []
+        last_seq = {}
+        if status == "done" and upper == duration:
+            for row in step_rows:
+                if row[4] is not None and row[4] <= upper:
+                    last_seq[row[0]] = max(last_seq.get(row[0], row[1]),
+                                           row[1])
+        for row in step_rows:
+            lot_id, seq, recipe, eid, stock_in, reserved, start, end = row
+            lot = lots.get(lot_id)
+            incomplete = lot is not None and lot[3] is None
+            sentinel = (status == "done" and upper == duration and
+                        incomplete and end == duration and
+                        last_seq.get(lot_id) == seq)
+            tg = recipe_tg.get(recipe)
+            if need_wip and stock_in is not None and stock_in <= upper:
+                # WIP wait [t_stocker_in, t_reserved); group uses recipe TG.
+                if scope == "total":
+                    wait_targets = ["total"]
+                elif scope == "group":
+                    wait_targets = [tg] if tg in ids else []
+                else:
+                    wait_targets = []
+                for target in wait_targets:
+                    key = ("wip_wait", target)
+                    add_event(count_events, key, stock_in, 1, True)
+                    if reserved is not None:
+                        add_event(count_events, key, reserved, -1, True)
+
+            if need_wip and reserved is not None and reserved <= upper:
+                if scope == "total":
+                    targets = ["total"]
+                elif scope == "equip":
+                    targets = [eid] if eid in ids else []
+                else:
+                    group = equips.get(eid)
+                    targets = [group] if group in ids else []
+                for target in targets:
+                    key = ("wip_equip", target)
+                    add_event(count_events, key, reserved, 1, True)
+                    if end is not None and not sentinel:
+                        add_event(count_events, key, end, -1, True)
+
+            target = entity_for(row)
+            if metric == "avg_wait" and target in ids + ["total"] \
+                    and reserved is not None and stock_in is not None:
+                add_event(sum_events, ("wait", target), reserved,
+                          max(0.0, reserved - stock_in))
+                add_event(avg_events, ("wait", target), reserved, 1)
+            if end is None or end > upper or sentinel:
+                continue
+            if metric in ("completed_steps", "avg_process_time"):
+                if target in ids or target == "total":
+                    if start is not None:
+                        add_event(sum_events, ("proc", target), end,
+                                  end - start)
+                        add_event(avg_events, ("proc", target), end, 1)
+                    add_event(count_events, ("completed_steps", target),
+                              end, 1)
+
+        # State-duration integrals are represented by start/end count edges.
+        state_edges = {}
+        state_rows = db.execute(
+            "SELECT equip_id,state,t_start,t_end FROM equip_state"
+            " WHERE t_start<? AND (t_end IS NULL OR t_end>?)",
+            (upper, 0)) if need_state else []
+        for eid, state, start, end in state_rows:
+            if eid not in equips:
+                continue
+            if scope == "total":
+                targets = ["total"]
+            elif scope == "equip":
+                targets = [eid] if eid in ids else []
+            else:
+                group = equips[eid]
+                targets = [group] if group in ids else []
+            end_at = min(upper, end if end is not None else upper)
+            start_at = max(0.0, start)
+            if end_at <= start_at:
+                continue
+            for target in targets:
+                state_edges.setdefault((target, state), []).extend(
+                    ((start_at, 1), (end_at, -1)))
+
+        def prefix(events, include_zero=False):
+            events = sorted(events or ())
+            values = []
+            at = 0
+            acc = 0.0
+            for t in times:
+                while at < len(events) and (
+                        events[at][0] <= t if include_zero
+                        else events[at][0] > 0 and events[at][0] <= t):
+                    acc += events[at][1]
+                    at += 1
+                values.append(acc)
+            return values
+
+        def intervalize(values):
+            if mode == "cum":
+                return values
+            return [0.0] + [values[i] - values[i - 1]
+                            for i in range(1, len(values))]
+
+        # Counts and numeric-event prefixes.
+        count_values = {k: prefix(v, True) for k, v in count_events.items()}
+        sum_values = {k: prefix(v) for k, v in sum_events.items()}
+        avg_values = {k: prefix(v) for k, v in avg_events.items()}
+
+        def metric_values(entity, wanted):
+            if wanted.startswith("wip"):
+                if wanted == "wip":
+                    if scope == "total":
+                        return count_values.get(("wip_total", "total"),
+                                                [0] * len(times))
+                    a = count_values.get(("wip_wait", entity),
+                                         [0] * len(times))
+                    b = count_values.get(("wip_equip", entity),
+                                         [0] * len(times))
+                    return [x + y for x, y in zip(a, b)]
+                return count_values.get((wanted, entity), [0] * len(times))
+            if wanted == "completed_steps":
+                return intervalize(count_values.get(
+                    ("completed_steps", entity), [0] * len(times)))
+            if wanted == "avg_process_time":
+                sums = sum_values.get(("proc", entity), [0] * len(times))
+                cnts = avg_values.get(("proc", entity), [0] * len(times))
+                if mode == "bucket":
+                    sums, cnts = intervalize(sums), intervalize(cnts)
+                return [s / n if n else None for s, n in zip(sums, cnts)]
+            if wanted == "avg_wait":
+                sums = sum_values.get(("wait", entity), [0] * len(times))
+                cnts = avg_values.get(("wait", entity), [0] * len(times))
+                if mode == "bucket":
+                    sums, cnts = intervalize(sums), intervalize(cnts)
+                return [s / n if n else None for s, n in zip(sums, cnts)]
+            if wanted == "completed_lots":
+                return intervalize(count_values.get(
+                    ("completed_lots", "total"), [0] * len(times)))
+            if wanted in ("avg_cycle_time", "on_time_rate"):
+                if wanted == "avg_cycle_time":
+                    sums = sum_values.get(("cycle", "total"), [0] * len(times))
+                    cnts = avg_values.get(("cycle", "total"), [0] * len(times))
+                    if mode == "bucket":
+                        sums, cnts = intervalize(sums), intervalize(cnts)
+                    return [s / n if n else None for s, n in zip(sums, cnts)]
+                done = count_values.get(("completed_lots", "total"),
+                                        [0] * len(times))
+                on = count_values.get(("ontime", "total"), [0] * len(times))
+                due = count_values.get(("due", "total"), [0] * len(times))
+                if mode == "bucket":
+                    on, due = intervalize(on), intervalize(due)
+                return [o / d if d else None for o, d in zip(on, due)]
+            return []
+
+        def state_prefix(target, state):
+            events = state_edges.get((target, state), [])
+            events.sort()
+            values, event_idx, count, last_t, accumulated = [], 0, 0, 0.0, 0.0
+            for t in times:
+                while event_idx < len(events) and events[event_idx][0] <= t:
+                    edge_t = events[event_idx][0]
+                    accumulated += count * (edge_t - last_t)
+                    last_t = edge_t
+                    while event_idx < len(events) and \
+                            events[event_idx][0] == edge_t:
+                        count += events[event_idx][1]
+                        event_idx += 1
+                accumulated += count * (t - last_t)
+                last_t = t
+                values.append(accumulated)
+            return values
+
+        states = ("BUSY", "IDLE", "SETUP", "DOWN", "PM")
+        series = []
+        unit = "%"
+        if metric == "state_time":
+            target = "total" if scope == "total" else ids[0]
+            unit = "分"
+            for state in states:
+                vals = state_prefix(target, state)
+                series.append({"id": state, "label": state,
+                               "values": intervalize(vals)})
+        elif metric in ("utilization", "utilization_gross"):
+            unit = "%"
+            targets = ["total"] if scope == "total" else ids
+            for entity in targets:
+                state_vals = {s: state_prefix(entity, s) for s in states}
+                eq_n = (len(equips) if scope == "total" else
+                        1 if scope == "equip" else
+                        sum(1 for tg in equips.values() if tg == entity))
+                values = []
+                for i, t in enumerate(times):
+                    start = 0.0 if mode == "cum" else (
+                        times[i - 1] if i else 0.0)
+                    length = t - start
+                    busy = state_vals["BUSY"][i] - (
+                        state_vals["BUSY"][i - 1] if mode == "bucket" and i else
+                        0.0)
+                    pm = state_vals["PM"][i] - (
+                        state_vals["PM"][i - 1] if mode == "bucket" and i else
+                        0.0)
+                    down = state_vals["DOWN"][i] - (
+                        state_vals["DOWN"][i - 1] if mode == "bucket" and i else
+                        0.0)
+                    gross = length * eq_n
+                    den = gross if metric == "utilization_gross" else \
+                        gross - pm - down
+                    values.append(busy / den if den > 0 else None)
+                series.append({"id": entity,
+                               "label": labels.get(entity, entity),
+                               "values": values})
+        else:
+            unit = ("ロット" if metric in ("wip", "wip_wait", "wip_equip",
+                                             "completed_steps",
+                                             "completed_lots") else
+                    "%" if metric == "on_time_rate" else "分")
+            for entity in ids:
+                vals = metric_values(entity, metric)
+                series.append({"id": entity,
+                               "label": labels.get(entity, entity),
+                               "values": vals})
+        return 200, {
+            "ok": True, "step": step, "times": times,
+            "series": series, "unit": unit, "warnings": warnings,
+        }
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------- レイアウト編集
 def _model_layout(params, cfg, remote_user):
     model = params.get("model", "")
@@ -1171,6 +1575,7 @@ DISPATCH = {
     "layout_save": _layout_save, "layout_auto": _layout_auto,
     "start": _start, "cancel": _cancel,
     "results": _results,
+    "results_series": _results_series,
     "model_files": _model_files, "model_validate": _model_validate,
     "model_lock": _model_lock, "model_unlock": _model_unlock,
     "model_save": _model_save, "model_clone": _model_clone,

@@ -119,6 +119,8 @@ class ResultsApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(r["progress_time"], 60)
         self.assertEqual(self.get(t="60.1")[0], 400)
+        _, series = self.series("wip", step=10)
+        self.assertEqual(series["times"][-1], 60)
 
     def test_wip_group_rollup_and_completion(self):
         _, r = self.get(t="100")
@@ -170,6 +172,105 @@ class ResultsApiTest(unittest.TestCase):
         _, r = self.get(t="100")
         self.assertFalse(r["has_wafers"])
         self.assertIsNone(r["total"]["wafer_count"])
+
+    def series(self, metric, scope="total", ids="", step=50, mode="bucket"):
+        return apilib.dispatch("results_series", {
+            "run": RUN, "metric": metric, "scope": scope, "ids": ids,
+            "step": str(step), "mode": mode})
+
+    def test_series_wip_and_bucket_cumulative_metrics(self):
+        status, r = self.series("wip")
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["times"][:3], [0, 50.0, 100.0])
+        self.assertEqual(r["series"][0]["label"], "全体")
+        self.assertEqual(r["series"][0]["values"][:3], [1, 3, 2])
+        _, wip_cum = self.series("wip", mode="cum")
+        self.assertEqual(r["series"][0]["values"],
+                         wip_cum["series"][0]["values"])
+
+        _, waited = self.series("wip_wait", scope="group", ids="TG1")
+        self.assertEqual(waited["series"][0]["values"][:3], [1, 1, 0])
+        _, equipment = self.series("wip_equip", scope="equip", ids="E1")
+        self.assertEqual(equipment["series"][0]["values"][:3], [0, 1, 1])
+
+        _, steps = self.series("completed_steps")
+        self.assertEqual(steps["series"][0]["values"][:3], [0, 0, 1])
+        _, avg_proc = self.series("avg_process_time")
+        self.assertIsNone(avg_proc["series"][0]["values"][1])
+        self.assertEqual(avg_proc["series"][0]["values"][2], 50)
+        _, avg_wait = self.series("avg_wait")
+        self.assertEqual(avg_wait["series"][0]["values"][:3], [None, 10, 60])
+        _, cum_wait = self.series("avg_wait", mode="cum")
+        self.assertEqual(cum_wait["series"][0]["values"][2], 35)
+
+    def test_series_state_time_and_utilization(self):
+        _, r = self.series("state_time", scope="equip", ids="E1",
+                           mode="cum")
+        by_state = {x["id"]: x["values"] for x in r["series"]}
+        self.assertEqual(by_state["BUSY"][:3], [0, 30, 60])
+        self.assertEqual(by_state["SETUP"][:3], [0, 0, 10])
+        _, util = self.series("utilization")
+        self.assertEqual(util["series"][0]["values"][2], 0.3)
+        _, gross = self.series("utilization_gross", mode="cum")
+        self.assertAlmostEqual(gross["series"][0]["values"][2], 60 / 200)
+
+    def test_series_results_consistency(self):
+        _, s = self.series("completed_steps", mode="cum")
+        _, r = self.get(t="100", mode="cum")
+        self.assertEqual(s["times"][2], 100)
+        self.assertEqual(s["series"][0]["values"][2],
+                         r["total"]["completed_steps"])
+        _, s = self.series("avg_wait", mode="bucket", step=50)
+        _, r = self.get(t="100", mode="window", window="50")
+        self.assertEqual(s["series"][0]["values"][2],
+                         r["total"]["dispatch_wait_avg"])
+        _, s = self.series("utilization", mode="bucket", step=50)
+        _, r = self.get(t="100", mode="window", window="50")
+        self.assertAlmostEqual(s["series"][0]["values"][2],
+                               r["total"]["utilization"])
+
+    def test_series_point_cap_and_input_validation(self):
+        c = sqlite3.connect(os.path.join(self.rdir, "result.db"))
+        c.execute("UPDATE meta SET value='10000' WHERE key='duration'")
+        c.commit()
+        c.close()
+        _, r = self.series("wip", step=1)
+        self.assertLessEqual(len(r["times"]), 500)
+        self.assertGreater(r["step"], 1)
+        self.assertEqual(r["times"][-1], 10000)
+        self.assertEqual(self.series("wip", step=0)[0], 400)
+        self.assertEqual(self.series("wip", step="NaN")[0], 400)
+        self.assertEqual(self.series("unknown")[0], 400)
+        self.assertEqual(self.series("wip", scope="group",
+                                     ids="NO_GROUP")[0], 400)
+        c = sqlite3.connect(os.path.join(self.rdir, "result.db"))
+        for i in range(3, 9):
+            c.execute("INSERT INTO equipments VALUES(?,?,?,?)",
+                      ("E%d" % i, "A1", "TG1", 1))
+        c.commit()
+        c.close()
+        status, r = self.series(
+            "wip", scope="equip", ids="E1,E2,E3,E4,E5,E6")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(r["series"]), 6)
+        self.assertEqual(self.series(
+            "wip", scope="equip",
+            ids="E1,E2,E3,E4,E5,E6,E7")[0], 400)
+        self.assertEqual(apilib.dispatch(
+            "results_series", {"run": RUN, "metric": "wip"},
+            method="POST")[0], 400)
+
+    def test_series_missing_group_map_hides_wait(self):
+        c = sqlite3.connect(os.path.join(self.rdir, "result.db"))
+        c.execute("DROP TABLE recipes")
+        c.commit()
+        c.close()
+        os.remove(os.path.join(self.rdir, "config", "recipes.csv")) \
+            if os.path.exists(os.path.join(self.rdir, "config",
+                                            "recipes.csv")) else None
+        _, r = self.series("wip_wait", scope="group", ids="TG1")
+        self.assertTrue(r["warnings"])
+        self.assertEqual(r["series"], [])
 
 
 if __name__ == "__main__":

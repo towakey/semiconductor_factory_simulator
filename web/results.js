@@ -3,7 +3,10 @@ const API = "cgi-bin/api.py";
 const $ = id => document.getElementById(id);
 const R = { data: null, run: "", t: 0, max: 0, duration: 0, mode: "cum",
   window: 60, tab: "total", rows: [], sort: "", desc: false,
-  timer: null, shown: [] };
+  timer: null, shown: [], chartMetric: "wip", chartScope: "total",
+  chartIds: ["total"], chartMode: "bucket", chartStep: 60,
+  chartData: null, chartSeries: [], chartVisible: {}, chartHover: -1,
+  chartApi: false };
 
 async function api(action, params) {
   const u = new URL(API, location.href);
@@ -20,7 +23,10 @@ function timeLabel(v) {
   return `${n.toFixed(1)} 分 (${d}日 ${hh}:${mm})`;
 }
 function fmt(key, v) {
-  if (v == null || !Number.isFinite(+v)) return "-";
+  if (v == null) return "-";
+  if (typeof v === "string" && v.trim() !== "" && !Number.isFinite(+v))
+    return v;
+  if (!Number.isFinite(+v)) return "-";
   if (key === "utilization" || key === "utilization_gross" ||
       key === "on_time_rate") return `${(+v * 100).toFixed(1)}%`;
   if (["avg_process_time","dispatch_wait_avg","dispatch_wait_max",
@@ -85,6 +91,8 @@ async function refreshRun() {
     R.t = max;
   syncTime();
   await fetchResults();
+  await fetchSeries();
+  await fetchSeries();
 }
 async function fetchResults() {
   if (!R.run) return;
@@ -196,11 +204,35 @@ function renderTable() {
   let body=sp(start);
   for (let i=start;i<end;i++) {
     const r=rows[i];
-    body += `<tr>${cols.map(([k]) => `<td>${esc(fmt(k,valueOf(r,k)))}</td>`).join("")}</tr>`;
+    const scope = R.tab === "groups" ? "group" : "equip";
+    const id = scope === "group" ? r.tool_group : r.equip_id;
+    const selected = R.chartScope === scope && R.chartIds.includes(id);
+    body += `<tr data-chart-id="${esc(id)}" class="${selected ? "chart-selected" : ""}">` +
+      `${cols.map(([k]) => `<td>${esc(fmt(k,valueOf(r,k)))}</td>`).join("")}</tr>`;
   }
   body += sp(rows.length-end);
   table.querySelector("tbody").innerHTML = body ||
     `<tr><td class="empty" colspan="${cols.length}">該当データなし</td></tr>`;
+  table.querySelectorAll("tbody tr[data-chart-id]").forEach(tr =>
+    tr.onclick = () => {
+      const id = tr.dataset.chartId;
+      if (R.chartScope !== (R.tab === "groups" ? "group" : "equip")) return;
+      if (R.chartMetric === "state_time") {
+        if (R.chartIds.includes(id))
+          R.chartIds = R.chartIds.length > 1
+            ? R.chartIds.filter(x => x !== id) : [];
+        else R.chartIds = [id];
+      } else if (R.chartIds.includes(id)) {
+        R.chartIds = R.chartIds.filter(x => x !== id);
+      } else if (R.chartIds.length >= 6) {
+        $("chartHint").textContent = "系列は最大6件です";
+        return;
+      } else {
+        R.chartIds.push(id);
+      }
+      renderTable();
+      fetchSeries();
+    });
   table.querySelectorAll("th").forEach(th => th.onclick = () => {
     const k=th.dataset.key;
     R.desc = R.sort === k ? !R.desc : false; R.sort=k; renderTable();
@@ -208,6 +240,8 @@ function renderTable() {
 }
 function render() {
   renderSummary();
+  renderLegend();
+  drawChart();
   $("filters").hidden = R.tab !== "equips";
   $("tableWrap").hidden = R.tab === "total";
   if (R.tab === "total") return;
@@ -252,6 +286,7 @@ function downloadCsv() {
 }
 function bind() {
   $("run").onchange=async()=>{R.run=$("run").value;R.t=0;
+    R.chartIds=R.chartScope==="total"?["total"]:[];
     $("viewer").href=`index.html?run=${encodeURIComponent(R.run)}`;
     await refreshRun();};
   $("refresh").onclick=refreshRun;
@@ -281,8 +316,13 @@ function bind() {
   $("windowCustom").onchange=()=>{R.window=+$("windowCustom").value;scheduleFetch();};
   document.querySelectorAll("#tabs button[data-tab]").forEach(b=>b.onclick=()=>{
     R.tab=b.dataset.tab;
+    R.chartScope=R.tab==="groups"?"group":
+      R.tab==="equips"?"equip":"total";
+    R.chartIds=R.chartScope==="total"?["total"]:[];
+    $("chartScope").value=R.chartScope;
     document.querySelectorAll("#tabs button[data-tab]").forEach(x=>x.classList.toggle("active",x===b));
     render();
+    fetchSeries();
   });
   $("groupFilter").onchange=renderTable;
   $("areaFilter").onchange=renderTable;
@@ -292,4 +332,5 @@ function bind() {
   });
 }
 bind();
+bindChart();
 loadRuns(new URLSearchParams(location.search).get("run"));
