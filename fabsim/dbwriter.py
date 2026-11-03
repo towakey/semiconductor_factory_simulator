@@ -16,6 +16,7 @@ SCHEMA = [
     """CREATE TABLE equip_port_lots(equip_id TEXT, lot_id TEXT,
                                  t_start REAL, t_end REAL)""",
     """CREATE INDEX idx_epl_t ON equip_port_lots(t_start, t_end)""",
+    """CREATE TABLE recipes(recipe TEXT PRIMARY KEY, tool_group TEXT)""",
     """CREATE TABLE stockers(stocker_id TEXT PRIMARY KEY, area TEXT,
                             capacity INTEGER, x REAL, y REAL,
                             w REAL, h REAL)""",
@@ -27,7 +28,7 @@ SCHEMA = [
                              x REAL, y REAL)""",
     """CREATE TABLE lots(lot_id TEXT PRIMARY KEY, product TEXT,
                         priority INTEGER, release_time REAL, due_date REAL,
-                        complete_time REAL)""",
+                        complete_time REAL, wafers INTEGER)""",
     """CREATE TABLE lot_steps(lot_id TEXT, seq INTEGER, step_name TEXT,
                              recipe TEXT, equip_id TEXT,
                              t_stocker_in REAL, t_reserved REAL,
@@ -50,6 +51,9 @@ SCHEMA = [
     "CREATE INDEX idx_clr_t ON cl_rides(t_load, t_unload)",
     "CREATE INDEX idx_sl_t ON stocker_lots(t_start, t_end)",
     "CREATE INDEX idx_ls_lot ON lot_steps(lot_id)",
+    "CREATE INDEX idx_ls_reserved ON lot_steps(t_reserved)",
+    "CREATE INDEX idx_ls_start_end ON lot_steps(t_start, t_end)",
+    "CREATE INDEX idx_lots_complete ON lots(complete_time)",
     "CREATE INDEX idx_kpi ON kpi_ts(metric, t)",
 ]
 
@@ -67,7 +71,7 @@ PLAIN = {
 LIVE = {
     "lots": (("lot_id",),
              ("lot_id", "product", "priority", "release_time", "due_date",
-              "complete_time")),
+              "complete_time", "wafers")),
     "lot_steps": (("lot_id", "seq"),
                   ("lot_id", "seq", "step_name", "recipe", "equip_id",
                    "t_stocker_in", "t_reserved", "t_start", "t_end")),
@@ -130,6 +134,9 @@ class DBWriter(object):
                          "rect") if model.tool_groups.get(e.tool_group)
                  else "rect",
                  r.get("w"), r.get("h"), e.ports))
+        for recipe in sorted(model.recipes.values(), key=lambda x: x.recipe):
+            cur.execute("INSERT INTO recipes VALUES(?,?)",
+                        (recipe.recipe, recipe.tool_group))
         for s in sorted(model.stockers.values(), key=lambda x: x.stocker_id):
             r = nodes.get(("stocker", s.stocker_id), {})
             cur.execute(
@@ -170,7 +177,8 @@ class DBWriter(object):
             "lot_id": lot.lot_id, "product": lot.product.name,
             "priority": lot.priority,
             "release_time": round(lot.release_time, 6),
-            "due_date": round(lot.due_date, 6), "complete_time": None})
+            "due_date": round(lot.due_date, 6), "complete_time": None,
+            "wafers": lot.wafers})
 
     def lot_complete(self, lot_id, t):
         row = self._live_touch("lots", (lot_id,))

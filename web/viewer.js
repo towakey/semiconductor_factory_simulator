@@ -35,6 +35,11 @@ async function init() {
   $("model").innerHTML = r.models.map(m =>
     `<option>${m}</option>`).join("");
   await refreshRuns();
+  const requestedRun = new URLSearchParams(location.search).get("run");
+  if (requestedRun && [...$("run").options].some(o => o.value === requestedRun)) {
+    $("run").value = requestedRun;
+    await loadRun(requestedRun);
+  }
   fit();
   requestAnimationFrame(frame);
   setInterval(pollStatus, 2500);
@@ -90,6 +95,11 @@ async function loadRun(rid) {
   $("seek").max = Math.floor(+r.meta.duration || 1000);
 }
 $("run").onchange = () => { V.lay = null; V.t = 0; loadRun($("run").value); };
+$("btnResults").onclick = () => {
+  const q = $("run").value
+    ? "?run=" + encodeURIComponent($("run").value) : "";
+  location.href = "results.html" + q;
+};
 
 async function ensureWindow() {
   const W = Math.max(V.speed * 30, 60);

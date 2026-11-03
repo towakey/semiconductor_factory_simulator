@@ -407,6 +407,7 @@ semiconductor_factory_simulator/
 - 搬送の時間内訳(`stocker_wait` 〜 `port_wait`)の合計が、処理時間を除いたロットの滞留時間と一致する。
 - DB: 区間テーブルで、終了時点で `t_end` が未確定の行が残らない(全てクローズされる)。同一設備の `equipment_state` 区間が重ならず、隙間なく並ぶ。DB の集計値(稼働率・完了ロット数)が `summary.json` と一致する。
 - API: 不正な `run`/`model`/パラメータ(パス区切り、`..`、範囲外の値)が拒否される。`window` の結果が手計算の区間と一致し、行数上限で打ち切られる。POST 専用の操作が GET で拒否される。
+- 結果表示(`test_results.py`): WIP境界、累積/区間期間境界、状態時間の重なり・未終了区間打切り、稼働率2種、待ち平均/最大、0件の null、範囲外400、GET専用、古いDBの recipes CSV フォールバック/未対応警告を手計算と照合する。
 - 構成付きレイアウト保存(`test_structure_save.py`): 設備追加/削除(qualifications カスケード)/エリア移動/エリア+ストッカー追加/検証エラー 400 で全ファイル不変/モデルロック未保持 403/両リビジョン不一致 409/履歴 20 世代/structure 無しの従来保存維持。
 - モデル設定編集(`test_modelstore.py`): `model_files` の往復で内容が変わらない。検証エラー(必須列欠落・参照切れ・重複・不正 enum・負値)で保存が 400 かつファイル不変。ロック 409/期限切れ/403。base_revision 不一致 409。履歴 20 世代。clone(名前検証・重複 409・ロック非複製)。パス/`..` 拒否、GET での POST API 拒否、本文上限。
 - レイアウト保存(`test_layoutstore.py`): ① ノード集合の過不足・重複・NaN・範囲外・巨大本文が 400 になる。② ロックを他クライアントが保持中なら取得が 409、期限切れなら取得できる。③ ロックを持たないクライアントの保存は 403、`base_revision` 不一致は 409 で `layout.csv` が変わらない。④ 保存で履歴が増え、21 世代目で最古が削除される。⑤ 保存が原子的(途中で例外が起きても元の `layout.csv` が残る)。⑥ `layout.csv` が一部のみ/余分な ID を含む場合に補完・無視される。⑦ BOM 付き `layout.csv` を読める。
@@ -449,9 +450,10 @@ semiconductor_factory_simulator/
 | `areas` | area, agv_count, x, y, w, h | エリア(描画用の矩形を含む) |
 | `equipments` | equip_id, area, tool_group, x, y, shape, w, h, ports | 設備と描画位置・サイズ(古い run は w=40,h=30,shape=rect,ports=1 とみなす) |
 | `equip_port_lots` | equip_id, lot_id, t_start, t_end | ロットが設備ポートを占有した区間(予約〜ProcessEnd) |
+| `recipes` | recipe, tool_group | 結果集計用のレシピ→ツールグループ対応(古い run は config CSV から補完) |
 | `stockers` | stocker_id, area, capacity, x, y, w, h | ストッカーと描画位置・サイズ(古い run は w=60,h=40 とみなす) |
 | `cl_stations` | seq, stocker_id, base_time, time_to_next | CL の駅順と、位相 0 のキャリアの駅到着時刻 |
-| `lots` | lot_id, product, priority, release_time, due_date, complete_time | ロット |
+| `lots` | lot_id, product, priority, release_time, due_date, complete_time, wafers | ロット(古い run は wafers 列なし) |
 | `lot_steps` | lot_id, seq, step_name, recipe, equip_id, t_stocker_in, t_reserved, t_start, t_end | 工程ごとの履歴(ストッカー待ち〜処理終了) |
 | `equip_state` | equip_id, state, lot_id, recipe, t_start, t_end | 設備の状態区間(IDLE/RESERVED/BUSY/SETUP/DOWN/PM) |
 | `stocker_lots` | stocker_id, lot_id, t_start, t_end | ロットがストッカーに格納されている区間。格納数は集計で出す |
@@ -642,6 +644,16 @@ layout.csv   ★node_type, ★node_id, ★x, ★y, w, h
 - 保存はロック所有・base_revision 一致(409)・編集権限・`config.load_model` の全件検証を満たす場合のみ。警告のみなら保存可。一時ディレクトリに全 CSV を書いて検証後、各ファイルを tempfile+os.replace で置換。空になった任意ファイル(qualifications/setups/release)は削除。# コメント行は保存で失われる(UI に明記)。
 - 新規モデルは既存モデルの複製(model_clone)で作成し、ロック・履歴ファイルは複製しない。
 
+### 12.7 結果表示画面
+
+- `results.html` は run を選び、時点を1時間刻みのスライダー・日/時/分入力・±1時間ボタン・最終時点ボタンで指定する。running 中は progress_time までを選択でき、更新で再取得する。
+- 集計期間は累積 `[0,t]` または区間 `[max(0,t-N),t]`。WIP は常に時点 t の瞬時値で、期間モードの影響を受けない。
+- 全体タブは投入/完了累計、期間完了数、WIP(グループ待ち・設備上・搬送等)、平均 CT、設備稼働率、工程処理/待ちをカード表示。グループ/装置タブは処理実績、状態時間、待ち、稼働率を表表示し、装置はグループ/エリアで絞り込みできる。列ソートと現在表の BOM 付き CSV ダウンロードに対応。
+- WIP: 未完了投入ロット数。グループ待ちは `t_stocker_in <= t < t_reserved`、設備上は `t_reserved <= t < t_end`。装置は設備上・処理中(`t_start <= t`)・搬入/段取り待ちと ports を表示する。
+- DB は未完了工程の `t_end` を終了時に duration で閉じるため、選択時点が run の duration と完全一致する場合、未完了ロットの最後の工程で `t_end=duration` の行は「終了時クローズ用の番兵値」として WIP に含め、完了工程実績からは除外する。
+- 期間 P の工程実績は `t_end > P_start AND t_end <= t`。処理時間は `t_end-t_start`(段取りを含まない)。待ちは `t_reserved` が P 内の工程で `t_reserved-t_stocker_in`、搬入〜処理開始は `t_start-t_reserved`。状態時間は `equip_state` 区間と P の重なりを状態別に合算し、未終了区間は t で打ち切る。稼働率は BUSY/(P時間−PM−DOWN) と BUSY/P時間の2種。
+- GET `results` は result.db を `mode=ro` で読み、時点・累積/区間を検証して全体/グループ/装置集計を返す。新規 DB は `recipes(recipe,tool_group)` と `lots.wafers` を焼き込み、古い run は `config/recipes.csv` で補完する。対応表も無ければグループ帰属不能の警告、wafers 列が無ければウェハ指標を省略する。
+
 ## 13. IIS + Python 3.7 CGI(既定の実行環境)
 
 ### 13.1 構成
@@ -678,6 +690,7 @@ layout.csv   ★node_type, ★node_id, ★x, ★y, w, h
 | GET | `window` | run, t0, t1 | `[t0, t1]` と重なる区間(`equip_state` / `stocker_lots` / `agv_moves` / `cl_rides`)を列形式で返す |
 | GET | `kpi` | run, t | 時刻 `t` に最も近い `kpi_ts` の値 |
 | GET | `summary` | run | `meta.summary_json` |
+| GET | `results` | run, t, mode=cum\|window, [window] | 時点 t と累積/直前 N 分の全体・グループ・装置指標。WIP は瞬時値 |
 | GET | `model_layout` | model | 編集用のレイアウト: 全ノードの座標(`layout.csv` + 自動配置で補完)、設備のツールグループ、`world`、`revision`、ロック状態(所有者、残り時間、自分か)、`can_edit`、警告(補完したノード、無視したノード) |
 | POST | `layout_lock` | model, client_id | 編集ロックの取得/更新(ハートビート)。他者が保持中なら 409(所有者と残り時間付き) |
 | POST | `layout_unlock` | model, client_id | 自分のロックを解放 |

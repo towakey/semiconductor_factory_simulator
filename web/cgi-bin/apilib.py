@@ -4,6 +4,7 @@ python -m http.server --cgi でも動く。テストからは dispatch() を直�
 import csv
 import datetime
 import json
+import math
 import os
 import re
 import sqlite3
@@ -30,7 +31,7 @@ BAD_CHARS = re.compile(r"[/\\\x00]|\.\.")
 MAX_WINDOW = 4320.0        # 3日分
 MAX_ROWS = 50000
 GET_ACTIONS = {"models", "runs", "status", "layout", "window", "kpi",
-               "summary", "model_layout", "model_files"}
+               "summary", "results", "model_layout", "model_files"}
 POST_ACTIONS = {"start", "cancel", "layout_lock", "layout_unlock",
                 "layout_save", "layout_auto", "model_validate",
                 "model_lock", "model_unlock", "model_save", "model_clone"}
@@ -568,6 +569,306 @@ def _summary(params):
         db.close()
 
 
+def _results(params):
+    run = params.get("run", "")
+    if not _valid_run(run):
+        return _err(400, "bad_run")
+    mode = params.get("mode", "cum")
+    if mode not in ("cum", "window"):
+        return _err(400, "bad_mode")
+    db = _db(run)
+    if db is None:
+        return _err(404, "no_db")
+    try:
+        meta = _meta(db)
+        job = _job(_run_dir(run))
+        duration = _f(meta.get("duration"), _f(job.get("duration")))
+        status = meta.get("status", job.get("status", "unknown"))
+        progress = _f(meta.get("progress_time"))
+        try:
+            with open(os.path.join(_run_dir(run), "progress.json"),
+                      encoding="utf-8") as f:
+                progress = max(progress,
+                               _f(json.load(f).get("progress_time")))
+        except (OSError, ValueError):
+            pass
+        upper = min(duration, progress) if status in ("running", "queued") \
+            else duration
+        try:
+            t = float(params.get("t"))
+        except (TypeError, ValueError):
+            return _err(400, "bad_t")
+        if not math.isfinite(t) or t < 0 or t > upper:
+            return _err(400, "bad_range", max_time=upper)
+        if mode == "window":
+            try:
+                window = float(params.get("window"))
+            except (TypeError, ValueError):
+                return _err(400, "bad_window")
+            if not math.isfinite(window) or window < 1 or window > duration:
+                return _err(400, "bad_window")
+            p_start = max(0.0, t - window)
+        else:
+            window = None
+            p_start = 0.0
+        period = max(0.0, t - p_start)
+
+        def cols(table):
+            return {r[1] for r in db.execute("PRAGMA table_info(%s)" % table)}
+
+        # recipe -> tool_group: 新規DBテーブル、古いDBは run/config CSV。
+        recipe_tg = {}
+        warnings = []
+        try:
+            recipe_tg = dict(db.execute(
+                "SELECT recipe,tool_group FROM recipes"))
+        except sqlite3.Error:
+            recipe_tg = {}
+        if not recipe_tg:
+            path = os.path.join(_run_dir(run), "config", "recipes.csv")
+            try:
+                with open(path, encoding="utf-8-sig", newline="") as f:
+                    raw = [r for r in csv.reader(f)
+                           if r and not r[0].strip().startswith("#")]
+                if raw:
+                    ix = raw[0].index("recipe")
+                    it = raw[0].index("tool_group")
+                    recipe_tg = {r[ix]: r[it] for r in raw[1:]
+                                 if len(r) > max(ix, it)}
+            except (OSError, ValueError, IndexError):
+                pass
+        if not recipe_tg:
+            warnings.append(
+                "この run には recipes 対応表がありません。"
+                "ツールグループ別の待ち/WIP 帰属は算出できません。")
+
+        equip_cols = cols("equipments")
+        eq_query = ("SELECT equip_id,area,tool_group"
+                    + (",ports" if "ports" in equip_cols else "")
+                    + " FROM equipments ORDER BY equip_id")
+        equips = {}
+        for r in db.execute(eq_query):
+            equips[r[0]] = {
+                "equip_id": r[0], "area": r[1], "tool_group": r[2],
+                "ports": (r[3] if "ports" in equip_cols and r[3] else 1)}
+        groups = sorted(set(recipe_tg.values()) |
+                        {e["tool_group"] for e in equips.values()})
+        by_group = {g: [] for g in groups}
+        for e in equips.values():
+            by_group.setdefault(e["tool_group"], []).append(e["equip_id"])
+
+        def new_acc():
+            return {
+                "completed_steps": 0, "process_sum": 0.0,
+                "process_n": 0, "wafer_count": 0, "wafer_n": 0,
+                "dispatch_sum": 0.0, "dispatch_n": 0,
+                "dispatch_max": None, "reserved_start_sum": 0.0,
+                "reserved_start_n": 0,
+                "state_minutes": dict((s, 0.0) for s in
+                    ("BUSY", "IDLE", "RESERVED", "SETUP", "DOWN", "PM")),
+                "wip_wait_ids": set(), "wip_equip_ids": set(),
+                "wip_processing_ids": set(), "wip_reserved_ids": set(),
+                "period_cycles": [], "period_ontime": 0,
+                "period_due_n": 0, "period_completed_lots": 0,
+            }
+
+        total = new_acc()
+        group_acc = {g: new_acc() for g in groups}
+        equip_acc = {eid: new_acc() for eid in equips}
+        lot_cols = cols("lots")
+        wafer_ok = "wafers" in lot_cols
+        lot_query = ("SELECT lot_id,product,release_time,due_date,complete_time"
+                     + (",wafers" if wafer_ok else "") + " FROM lots")
+        lots = {}
+        released = completed_cum = 0
+        wip_ids = set()
+        for r in db.execute(lot_query):
+            wafers = r[5] if wafer_ok else None
+            lots[r[0]] = {"product": r[1], "release": r[2], "due": r[3],
+                          "complete": r[4], "wafers": wafers}
+            if r[2] is not None and r[2] <= t:
+                released += 1
+                if r[4] is None or r[4] > t:
+                    wip_ids.add(r[0])
+                else:
+                    completed_cum += 1
+            if r[4] is not None and p_start < r[4] <= t:
+                total["period_completed_lots"] += 1
+                total["period_cycles"].append(r[4] - r[2])
+                if r[3] is not None:
+                    total["period_due_n"] += 1
+                    if r[4] <= r[3]:
+                        total["period_ontime"] += 1
+
+        def add_wait(acc, step):
+            reserved, stock_in, start = step[5], step[4], step[6]
+            if reserved is not None and p_start < reserved <= t \
+                    and stock_in is not None:
+                w = max(0.0, reserved - stock_in)
+                acc["dispatch_sum"] += w
+                acc["dispatch_n"] += 1
+                acc["dispatch_max"] = (w if acc["dispatch_max"] is None
+                    else max(acc["dispatch_max"], w))
+            if reserved is not None and start is not None \
+                    and p_start < reserved <= t:
+                acc["reserved_start_sum"] += max(0.0, start - reserved)
+                acc["reserved_start_n"] += 1
+
+        steps = db.execute(
+            "SELECT lot_id,seq,recipe,equip_id,t_stocker_in,t_reserved,"
+            "t_start,t_end"
+            " FROM lot_steps WHERE t_stocker_in<=? OR t_reserved<=? OR"
+            " t_end<=?", (t, t, t)).fetchall()
+        current_seq = {}
+        for st in steps:
+            if st[0] in wip_ids:
+                current_seq[st[0]] = max(current_seq.get(st[0], st[1]), st[1])
+        group_wait = {}
+        for st in steps:
+            lot_id, seq, recipe, eid, stock_in, reserved, start, end = st
+            tg = recipe_tg.get(recipe)
+            ga = group_acc.get(tg)
+            ea = equip_acc.get(eid)
+            sentinel_end = (lot_id in wip_ids and
+                            current_seq.get(lot_id) == seq and
+                            status == "done" and
+                            end == duration and t == duration)
+            if (not sentinel_end and
+                    p_start < (end if end is not None else -1) <= t):
+                total["completed_steps"] += 1
+                for acc in (ga, ea):
+                    if acc is None:
+                        continue
+                    acc["completed_steps"] += 1
+                    if start is not None:
+                        acc["process_sum"] += end - start
+                        acc["process_n"] += 1
+                        if lot_id in lots and lots[lot_id]["wafers"] is not None:
+                            acc["wafer_count"] += lots[lot_id]["wafers"]
+                            acc["wafer_n"] += 1
+                if start is not None:
+                    total["process_sum"] += end - start
+                    total["process_n"] += 1
+                    if lot_id in lots and lots[lot_id]["wafers"] is not None:
+                        total["wafer_count"] += lots[lot_id]["wafers"]
+                        total["wafer_n"] += 1
+            for acc in (total, ga, ea):
+                if acc is not None:
+                    add_wait(acc, st)
+            if lot_id in wip_ids and current_seq.get(lot_id) == seq:
+                if reserved is None or reserved > t:
+                    if stock_in is not None and stock_in <= t:
+                        group_wait.setdefault(tg, set()).add(lot_id)
+                        if ga is not None:
+                            ga["wip_wait_ids"].add(lot_id)
+                elif reserved <= t and (end is None or end > t or
+                                        sentinel_end):
+                    if eid in equips:
+                        e_group = equips[eid]["tool_group"]
+                        equip_acc[eid]["wip_equip_ids"].add(lot_id)
+                        group_acc[e_group]["wip_equip_ids"].add(lot_id)
+                        if start is not None and start <= t:
+                            equip_acc[eid]["wip_processing_ids"].add(lot_id)
+                            group_acc[e_group]["wip_processing_ids"].add(lot_id)
+                        else:
+                            equip_acc[eid]["wip_reserved_ids"].add(lot_id)
+                            group_acc[e_group]["wip_reserved_ids"].add(lot_id)
+                    total["wip_equip_ids"].add(lot_id)
+
+        # Group waiting sets already derive from recipe; only count once.
+        total_wait = set().union(*group_wait.values()) if group_wait else set()
+        total["wip_wait_ids"] = total_wait
+        total["wip_processing_ids"] = set().union(
+            *(a["wip_processing_ids"] for a in equip_acc.values())) \
+            if equip_acc else set()
+        total["wip_reserved_ids"] = total["wip_equip_ids"] - \
+            total["wip_processing_ids"]
+        # Interval state durations, clipped to P.
+        state_rows = db.execute(
+            "SELECT equip_id,state,t_start,t_end FROM equip_state"
+            " WHERE t_start<? AND (t_end IS NULL OR t_end>?)",
+            (t, p_start))
+        for eid, state, start, end in state_rows:
+            dt = max(0.0, min(t, end if end is not None else t) -
+                     max(p_start, start))
+            if dt <= 0:
+                continue
+            total["state_minutes"][state] = \
+                total["state_minutes"].get(state, 0.0) + dt
+            if eid in equips:
+                ea = equip_acc[eid]
+                ea["state_minutes"][state] = \
+                    ea["state_minutes"].get(state, 0.0) + dt
+                ga = group_acc.get(equips[eid]["tool_group"])
+                if ga:
+                    ga["state_minutes"][state] = \
+                        ga["state_minutes"].get(state, 0.0) + dt
+
+        def avg(acc, key, nkey):
+            return acc[key] / acc[nkey] if acc[nkey] else None
+
+        def output(acc, n_equip=0):
+            sm = acc["state_minutes"]
+            busy = sm.get("BUSY", 0.0)
+            pm, down = sm.get("PM", 0.0), sm.get("DOWN", 0.0)
+            gross_den = period * n_equip
+            usable = gross_den - pm - down
+            return {
+                "completed_steps": acc["completed_steps"],
+                "avg_process_time": avg(acc, "process_sum", "process_n"),
+                "wafer_count": acc["wafer_count"] if acc["wafer_n"] else None,
+                "state_minutes": sm,
+                "utilization": busy / usable if usable > 0 else None,
+                "utilization_gross": busy / gross_den if gross_den > 0 else None,
+                "dispatch_wait_avg": avg(acc, "dispatch_sum", "dispatch_n"),
+                "dispatch_wait_max": acc["dispatch_max"],
+                "reserved_start_wait_avg": avg(
+                    acc, "reserved_start_sum", "reserved_start_n"),
+                "wip_wait": len(acc["wip_wait_ids"]),
+                "wip_equip": len(acc["wip_equip_ids"]),
+                "wip_processing": len(acc["wip_processing_ids"]),
+                "wip_reserved": len(acc["wip_reserved_ids"]),
+                "wip": len(acc["wip_wait_ids"] | acc["wip_equip_ids"]),
+            }
+
+        out_total = output(total, len(equips))
+        out_total.update({
+            "released_lots": released,
+            "completed_lots": completed_cum,
+            "completed_lots_period": total["period_completed_lots"],
+            "wip": len(wip_ids),
+            "wip_other": max(0, len(wip_ids) - len(total["wip_wait_ids"])
+                             - len(total["wip_equip_ids"])),
+            "avg_cycle_time": (sum(total["period_cycles"]) /
+                               len(total["period_cycles"])
+                               if total["period_cycles"] else None),
+            "on_time_rate": (total["period_ontime"] /
+                             total["period_due_n"]
+                             if total["period_due_n"] else None),
+        })
+        groups_out = []
+        for tg in groups:
+            acc = group_acc[tg]
+            item = {"tool_group": tg}
+            item.update(output(acc, len(by_group.get(tg, []))))
+            groups_out.append(item)
+        equips_out = []
+        for eid, e in equips.items():
+            item = dict(e)
+            item.update(output(equip_acc[eid], 1))
+            equips_out.append(item)
+        return 200, {
+            "ok": True, "run": run, "status": status, "t": t,
+            "mode": mode, "window": window, "p_start": p_start,
+            "progress_time": progress, "duration": duration,
+            "total": out_total, "groups": groups_out,
+            "equips": equips_out, "has_wafers": wafer_ok,
+            "warnings": warnings,
+        }
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------- レイアウト編集
 def _model_layout(params, cfg, remote_user):
     model = params.get("model", "")
@@ -869,6 +1170,7 @@ DISPATCH = {
     "layout_lock": _layout_lock, "layout_unlock": _layout_unlock,
     "layout_save": _layout_save, "layout_auto": _layout_auto,
     "start": _start, "cancel": _cancel,
+    "results": _results,
     "model_files": _model_files, "model_validate": _model_validate,
     "model_lock": _model_lock, "model_unlock": _model_unlock,
     "model_save": _model_save, "model_clone": _model_clone,

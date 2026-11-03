@@ -80,6 +80,17 @@ class DBWriterTest(unittest.TestCase):
             "SELECT COUNT(*) FROM lots WHERE complete_time IS NOT NULL"
         ).fetchone()[0]
         self.assertEqual(n_done, self.summary["completed_lots"])
+
+    def test_results_lookup_tables(self):
+        """結果画面用にレシピ対応とロットのウェハ数を焼き込む。"""
+        self.assertEqual(
+            self.c.execute(
+                "SELECT tool_group FROM recipes WHERE recipe='R1'"
+            ).fetchone()[0], "TG1")
+        self.assertEqual(
+            self.c.execute(
+                "SELECT wafers FROM lots ORDER BY lot_id LIMIT 1"
+            ).fetchone()[0], 25)
         # BUSY 時間の合計 → 稼働率が一致
         busy = self.c.execute(
             "SELECT SUM(t_end-t_start) FROM equip_state WHERE state='BUSY'"
