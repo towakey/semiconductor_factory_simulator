@@ -1,0 +1,4 @@
+stocker_id,area,capacity,in_ports,out_ports,port_time
+S1,PHOTO01,60,2,2,1
+S2,CVD01,60,2,2,1
+S3,FURNACE01,60,2,2,1

@@ -80,7 +80,7 @@ R1,TG1,-5,bad,worse
         self.assertGreaterEqual(len(errors), 2)
 
     def test_no_capable_equipment(self):
-        """どの設備も処理できないレシピはエラー。"""
+        """どの設備も処理できないレシピは警告(ロットは滞留するが実行可)。"""
         write_model(self.dir, **{
             "qualifications.csv": """equip_id,recipe
 EQ1,R_OTHER
@@ -89,9 +89,10 @@ EQ1,R_OTHER
 R1,TG1,10,lot,fixed
 R_OTHER,TG1,10,lot,fixed
 """})
-        model, errors, _ = config.load_model(self.dir)
-        self.assertTrue(any("処理できる設備" in e for e in errors),
-                        str(errors))
+        model, errors, warnings = config.load_model(self.dir)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("到達可能な設備" in w for w in warnings),
+                        str(warnings))
 
     def test_cleanliner_stations_mismatch(self):
         write_model(self.dir, **{
@@ -101,6 +102,41 @@ R_OTHER,TG1,10,lot,fixed
 """})
         model, errors, _ = config.load_model(self.dir)
         self.assertTrue(any("cleanliner" in e for e in errors), str(errors))
+
+    def test_agv_count_zero_ok(self):
+        """agv_count=0 は受理される(設備の無いエリアなら警告も無し)。"""
+        write_model(self.dir, **{
+            "areas.csv": "area,agv_count,agv_load_time,agv_unload_time\n"
+                         "A1,1,1,1\nA2,0,1,1\n",
+            "stockers.csv": "stocker_id,area,capacity,in_ports,out_ports,port_time\n"
+                            "S1,A1,50,1,1,0\nS2,A2,50,1,1,0\n",
+            "cleanliner.csv": "seq,stocker_id,time_to_next\n"
+                              "1,S1,10\n2,S2,10\n",
+        })
+        model, errors, warnings = config.load_model(self.dir)
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+
+    def test_agv_count_zero_with_equipment_warns(self):
+        """agv_count=0 のエリアに設備があると警告(エラーではない)。"""
+        write_model(self.dir, **{
+            "areas.csv": "area,agv_count,agv_load_time,agv_unload_time\n"
+                         "A1,0,1,1\n",
+        })
+        model, errors, warnings = config.load_model(self.dir)
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            any("AGV 0 台" in w and "EQ1" in w for w in warnings),
+            str(warnings))
+
+    def test_agv_count_negative_is_error(self):
+        """agv_count が負なら従来どおりエラー。"""
+        write_model(self.dir, **{
+            "areas.csv": "area,agv_count,agv_load_time,agv_unload_time\n"
+                         "A1,-1,1,1\n",
+        })
+        model, errors, _ = config.load_model(self.dir)
+        self.assertTrue(any("agv_count" in e for e in errors), str(errors))
 
     def test_validate_exit_codes(self):
         """正常=0、不正=2。"""

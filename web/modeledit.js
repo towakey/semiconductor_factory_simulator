@@ -13,7 +13,9 @@ const ME = {
   cid: "", files: {}, spec: {}, simSpec: {}, rev: "none",
   model: "", readonly: false, dirty: false, errs: [],
   undo: [], redo: [], tab: 0, sub: 0, routeFilter: "",
+  renames: [], notice: "", pkSet: new Set(),
 };
+const RENAME_RE = /^[A-Za-z0-9_:-]{1,64}$/;
 // client_id はタブ単位で保持(リロードで「他者ロック」化しないため)
 ME.cid = sessionStorage.fabsim_client_id || "";
 if (!/^[0-9a-f]{16,32}$/.test(ME.cid)) {
@@ -58,14 +60,22 @@ async function meLoad() {
       alert("他のユーザーが編集中です: " + (lk.owner || "?") + (lk.remaining ? "(残り " + lk.remaining + " 秒)" : ""));
     }
   }
+  // ref 先(=主キー列)の集合 "file:col"。リネーム対象の判定に使う。
+  ME.pkSet = new Set();
+  for (const spec of Object.values(ME.spec))
+    for (const c of spec) if (c[2] === "ref") ME.pkSet.add(c[3]);
+  for (const v of Object.values(ME.simSpec))
+    if (v[0] && v[0].startsWith("ref:")) ME.pkSet.add(v[0].slice(4));
   ME.dirty = false; ME.undo = []; ME.redo = []; ME.errs = [];
+  ME.renames = []; ME.notice = "";
   meStatus();
   meRenderTabs();
 }
 function meStatus() {
   $m("meStatus").textContent =
     (ME.readonly ? "読み取り専用 " : "") +
-    (ME.dirty ? "未保存変更あり" : "保存済み");
+    (ME.dirty ? "未保存変更あり" : "保存済み") +
+    (ME.notice ? " / " + ME.notice : "");
 }
 $m("meModel").onchange = () => { if (meConfirmDirty()) meLoad(); };
 function meConfirmDirty() {
@@ -211,28 +221,79 @@ function meRenderTable(fn) {
 }
 
 // ---------- 編集操作(Undo 対応・スナップショット) ----------
+// スナップショットは files とリネーム一覧を抱き合わせる
+// (リネーム+カスケードを Undo 1 ステップにし、保存時 renames と不整合にしない)。
 function meSnap() {
-  ME.undo.push(JSON.stringify(ME.files));
+  ME.notice = "";
+  ME.undo.push(JSON.stringify({ files: ME.files, renames: ME.renames }));
   if (ME.undo.length > 100) ME.undo.shift();
   ME.redo = [];
 }
 function meUndo() {
   const s = ME.undo.pop();
   if (!s) return;
-  ME.redo.push(JSON.stringify(ME.files));
-  ME.files = JSON.parse(s);
+  ME.redo.push(JSON.stringify({ files: ME.files, renames: ME.renames }));
+  const o = JSON.parse(s);
+  ME.files = o.files; ME.renames = o.renames || []; ME.notice = "";
   ME.dirty = true; meStatus(); meRenderTabs();
 }
 function meRedo() {
   const s = ME.redo.pop();
   if (!s) return;
-  ME.undo.push(JSON.stringify(ME.files));
-  ME.files = JSON.parse(s);
+  ME.undo.push(JSON.stringify({ files: ME.files, renames: ME.renames }));
+  const o = JSON.parse(s);
+  ME.files = o.files; ME.renames = o.renames || []; ME.notice = "";
   ME.dirty = true; meStatus(); meRenderTabs();
+}
+// 参照列(メタデータの ref 先が fn:col の列)の値を一括置換する。
+// sim.csv の value も SIM_SPECS の ref: を見て置換(release_stocker 等)。
+function meCascadeRename(fn, col, oldV, newV) {
+  const target = fn + ":" + col;
+  let n = 0;
+  for (const [fn2, spec] of Object.entries(ME.spec)) {
+    const t = ME.files[fn2];
+    if (!t) continue;
+    for (const c of spec) {
+      if (c[2] === "ref" && c[3] === target) {
+        const ci = t.cols.indexOf(c[0]);
+        for (const r of t.rows)
+          if (r[ci] === oldV) { r[ci] = newV; n++; }
+      }
+    }
+    if (fn2 === "sim.csv") {
+      const ki = t.cols.indexOf("key"), vi = t.cols.indexOf("value");
+      for (const r of t.rows) {
+        const so = ME.simSpec[r[ki]];
+        if (so && so[0] === "ref:" + target && r[vi] === oldV) {
+          r[vi] = newV; n++;
+        }
+      }
+    }
+  }
+  return n;
 }
 function meCellEdit(fn, ri, col, val) {
   const t = ME.files[fn], ci = t.cols.indexOf(col);
-  if (t.rows[ri][ci] === val) return;
+  const old = t.rows[ri][ci];
+  if (old === val) return;
+  if (ME.pkSet.has(fn + ":" + col)) {
+    // 主キーのリネーム: 他行と重複する新名は保存時に検証エラーになるので拒否
+    if (val && t.rows.some((r, i) => i !== ri && r[ci] === val)) {
+      alert(val + " は既に使われています(主キーの重複)");
+      meRenderTabs();
+      return;
+    }
+    meSnap();
+    t.rows[ri][ci] = val;
+    const n = old === "" ? 0 : meCascadeRename(fn, col, old, val);
+    // layout.csv 追従用にサーバーへ送るリネーム履歴
+    // (old/new が保存側の許容形式を満たす場合のみ記録)
+    if (RENAME_RE.test(old) && RENAME_RE.test(val))
+      ME.renames.push({ kind: fn, col: col, old: old, new: val });
+    ME.notice = n ? "参照 " + n + " 箇所を更新" : "";
+    ME.dirty = true; meStatus();
+    return;
+  }
   meSnap();
   t.rows[ri][ci] = val;
   ME.dirty = true; meStatus();
@@ -326,7 +387,8 @@ async function meSave() {
   if (!await meValidate()) { alert("検証エラーがあります。修正してください。"); return; }
   const r = await mApi("model_save", {
     model: ME.model, client_id: ME.cid,
-    base_revision: ME.rev, files: ME.files }, true);
+    base_revision: ME.rev, files: ME.files,
+    renames: ME.renames }, true);
   if (!r.ok) {
     if (r.error === "revision")
       alert("他の人が保存しました。再読込してください。");
@@ -337,8 +399,14 @@ async function meSave() {
     } else alert("保存失敗: " + r.error);
     return;
   }
-  ME.rev = r.revision; ME.dirty = false; meStatus();
-  alert("保存しました (rev " + r.revision + ")");
+  ME.rev = r.revision; ME.dirty = false;
+  // ディスクとメモリが一致したので、リネーム履歴と Undo/Redo を仕切り直す
+  // (保存済みリネームを Undo で「戻して」再送すると layout.csv と不整合になる)
+  ME.renames = []; ME.undo = []; ME.redo = []; ME.notice = "";
+  meStatus();
+  alert("保存しました (rev " + r.revision + ")" +
+        (r.layout_renamed ?
+         " / レイアウト参照 " + r.layout_renamed + " 箇所を更新" : ""));
 }
 $m("meSave").onclick = meSave;
 $m("meValidate").onclick = meValidate;

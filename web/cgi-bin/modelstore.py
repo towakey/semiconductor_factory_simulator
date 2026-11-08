@@ -20,6 +20,93 @@ MAX_BODY = 1024 * 1024   # 保存本文 1MB
 _OPTIONAL_DELETABLE = ("qualifications.csv", "setups.csv", "release.csv")
 _BAD_CELL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
+MAX_RENAMES = 200
+_RENAME_VALUE = re.compile(r"^[A-Za-z0-9_:-]{1,64}$")
+# kind → (node_id が主キーと一致する node_type, node_id が "主キー:k" 形式の
+# node_type)。それ以外の kind は layout.csv に影響しない。
+_LAYOUT_EXACT = {"equipments.csv": ("equip",),
+                 "stockers.csv": ("stocker",),
+                 "areas.csv": ("area",)}
+_LAYOUT_POINT = {"equipments.csv": "agv_point",
+                 "stockers.csv": "cl_point"}
+
+
+def _rename_targets():
+    """参照先となり得る主キー列 (file, col) の集合。
+    CSV_SPECS/SIM_SPECS の ref メタデータから導出する(単一情報源)。"""
+    out = set()
+    for spec in config.CSV_SPECS.values():
+        for c in spec:
+            if c[2] == "ref":
+                fn, _, col = c[3].partition(":")
+                out.add((fn, col))
+    for v in config.SIM_SPECS.values():
+        if v[0] and v[0].startswith("ref:"):
+            fn, _, col = v[0][4:].partition(":")
+            out.add((fn, col))
+    return out
+
+
+def check_renames(renames):
+    """renames パラメータの検証と正規化。
+    戻り値 (置換リスト or None, エラー文字列 or None)。
+    renames is None なら (None, None) = 未指定。"""
+    if renames is None:
+        return None, None
+    if not isinstance(renames, list) or len(renames) > MAX_RENAMES:
+        return None, "renames は %d 件以内のリストです" % MAX_RENAMES
+    allowed = _rename_targets()
+    out = []
+    for r in renames:
+        if not isinstance(r, dict):
+            return None, "renames の要素が不正です"
+        kind, col = r.get("kind"), r.get("col")
+        old, new = r.get("old"), r.get("new")
+        if (kind, col) not in allowed:
+            return None, "renames の kind/col が不正です: %r/%r" % (kind, col)
+        if not (isinstance(old, str) and _RENAME_VALUE.match(old)) or \
+                not (isinstance(new, str) and _RENAME_VALUE.match(new)):
+            return None, "renames の old/new が不正です"
+        if old != new:
+            out.append({"kind": kind, "col": col, "old": old, "new": new})
+    return out, None
+
+
+def rename_layout(mdir, renames):
+    """layout.csv の node_id をリネームに追従させる。戻り値は置換した行数。
+    .layout.lock の有無に関わらず実行する(座標の参照整合を保つため)。"""
+    path = os.path.join(mdir, "layout.csv")
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return 0
+    header = [c.strip() for c in rows[0]]
+    if "node_type" not in header or "node_id" not in header:
+        return 0
+    ti, ni = header.index("node_type"), header.index("node_id")
+    changed = 0
+    for r in rows[1:]:
+        if len(r) <= max(ti, ni):
+            continue
+        nt, nid = r[ti].strip(), r[ni]
+        orig = nid
+        for rn in renames:   # 記録順に適用(A→B→C の連鎖に対応)
+            kind, old, new = rn["kind"], rn["old"], rn["new"]
+            if nt in _LAYOUT_EXACT.get(kind, ()):
+                if nid == old:
+                    nid = new
+            elif nt == _LAYOUT_POINT.get(kind) and \
+                    nid.startswith(old + ":"):
+                nid = new + nid[len(old):]
+        if nid != orig:
+            r[ni] = nid
+            changed += 1
+    if changed:
+        write_csv_file(path, rows[0], rows[1:])
+    return changed
+
 
 def _paths(mdir):
     return {"lock": os.path.join(mdir, ".model.lock"),
@@ -236,8 +323,10 @@ def archive_history(mdir, user):
 
 
 def save_model(mdir, files, client_id, base_revision, user, can_edit,
-               now=None):
-    """保存手順。戻り値 (http_status, response_dict)。"""
+               now=None, renames=None):
+    """保存手順。戻り値 (http_status, response_dict)。
+    renames は主キーリネーム {kind,col,old,new} のリスト(任意)。
+    保存成功後に layout.csv の node_id へ適用する。"""
     if not can_edit:
         return 403, {"ok": False, "error": "forbidden"}
     st = lock_status(mdir, client_id, now)
@@ -252,6 +341,9 @@ def save_model(mdir, files, client_id, base_revision, user, can_edit,
     errors = _sanity(files)
     if errors:
         return 400, {"ok": False, "error": "invalid", "detail": errors}
+    ren, rerr = check_renames(renames)
+    if rerr:
+        return 400, {"ok": False, "error": "invalid", "detail": [rerr]}
     verr, vwarn = validate_files(mdir, files)
     if verr:
         return 400, {"ok": False, "error": "validation",
@@ -283,8 +375,12 @@ def save_model(mdir, files, client_id, base_revision, user, can_edit,
             if os.path.exists(tmp):
                 os.remove(tmp)
         raise
-    return 200, {"ok": True, "revision": revision(mdir),
-                 "warnings": vwarn}
+    resp = {"ok": True, "revision": revision(mdir), "warnings": vwarn}
+    if renames is not None:
+        n = rename_layout(mdir, ren) if ren else 0
+        resp["layout_renamed"] = n
+        resp["layout_updated"] = n > 0
+    return 200, resp
 
 
 _STRUCT_FILES = ("equipments.csv", "areas.csv", "stockers.csv",

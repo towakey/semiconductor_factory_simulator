@@ -107,6 +107,101 @@ failure_policy,resume
         self.assertEqual(agv.tasks, 5)
 
 
+class ZeroAgvAreaTest(unittest.TestCase):
+    """agv_count=0 のエリアは到達不可として行き先候補から除外され、
+    ロットは現在のストッカーに滞留するが、他エリアは正常に進み、
+    run は例外なく duration まで進む。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_zero_agv_area_waits_but_sim_completes(self):
+        write_model(self.dir, **{
+            "sim.csv": """key,value
+duration,120
+warmup,0
+seed,1
+dispatch_rule,FIFO
+release_mode,schedule
+lots_per_day,0
+release_control,fixed
+wip_limit,0
+release_stocker,S1
+area_select,LEAST_LOADED
+agv_out_first,1
+cl_carriers,1
+cl_slots,1
+cl_load_time,1
+cl_unload_time,1
+failure_policy,resume
+""",
+            "products.csv": """product,ratio,priority,due_factor,wafers
+PA,1.0,0,4,25
+PB,1.0,0,4,25
+""",
+            "recipes.csv": """recipe,tool_group,process_time,time_unit,dist,dist_param,batch_min,batch_max,batch_wait_max
+R1,TG1,10,lot,fixed,,,,
+R2,TG2,10,lot,fixed,,,,
+""",
+            "routes.csv": """product,seq,recipe,step_name
+PA,10,R1,s1
+PB,10,R2,s1
+""",
+            "tool_groups.csv": """tool_group,dispatch_rule
+TG1,
+TG2,
+""",
+            "equipments.csv": """equip_id,tool_group,area,agv_time,capacity,mtbf,mttr,pm_interval,pm_duration,initial_recipe
+EQ1,TG1,A1,5,1,0,0,0,0,
+EQ2,TG2,A2,5,1,0,0,0,0,
+""",
+            "areas.csv": """area,agv_count,agv_load_time,agv_unload_time
+A1,1,1,1
+A2,0,1,1
+""",
+            "stockers.csv": """stocker_id,area,capacity,in_ports,out_ports,port_time
+S1,A1,50,1,1,0
+S2,A2,50,1,1,0
+""",
+            "cleanliner.csv": """seq,stocker_id,time_to_next
+1,S1,10
+2,S2,10
+""",
+            "release.csv": """lot_id,product,release_time,priority,due_date
+LA,PA,0,0,
+LB,PB,0,0,
+""",
+        })
+        model, errors, warnings = config.load_model(self.dir)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("AGV 0 台" in w for w in warnings),
+                        str(warnings))
+        # AGV 0 台エリアの設備は「到達可能な設備なし」の警告も出る
+        self.assertTrue(any("到達可能な設備" in w for w in warnings),
+                        str(warnings))
+        sim = Simulator(model)
+        sim.run()                       # 例外なく duration まで進む
+        # A2 は行き先候補から除外されるため AGV タスク自体が発行されない
+        self.assertEqual(sim.fleets["A2"].agvs, [])
+        self.assertEqual(len(sim.fleets["A2"].queue), 0)
+        # LB は A1 のストッカーでキュー滞留(未完)
+        lb = sim.lots["LB"]
+        self.assertIsNone(lb.complete_time)
+        self.assertEqual(lb.state, "QUEUED")
+        self.assertEqual(lb.cur_stocker, "S1")
+        self.assertIn("LB", sim.stockers["S1"].stored)
+        # A1 側の LA は正常に完了
+        self.assertIsNotNone(sim.lots["LA"].complete_time)
+        # 統計も 0 台エリアを除算しない(t=60 の KPI tick 実行済み)
+        a2_util = [r[3] for r in sim.stats.kpi_rows
+                   if r[1] == "agv_util" and r[2] == "A2"]
+        self.assertTrue(a2_util and all(v == 0.0 for v in a2_util))
+        sim.stats.summary(sim)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -1,0 +1,5 @@
+area,agv_count,agv_load_time,agv_unload_time,agv_return_home
+PHOTO01,2,1,1,
+CVD01,2,1,1,
+FURNACE01,2,1,1,
+ETCH01,1,2,2,1

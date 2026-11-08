@@ -1550,7 +1550,7 @@ def _model_save(params, cfg, remote_user):
     return modelstore.save_model(
         _mdir(model), params.get("files"), cid,
         params.get("base_revision", ""), remote_user,
-        _can_edit(cfg, remote_user))
+        _can_edit(cfg, remote_user), renames=params.get("renames"))
 
 
 def _model_clone(params, cfg, remote_user):

@@ -336,6 +336,7 @@ def load_model(config_dir):
     _dup_check(rec_rows, ["recipe"], "recipes.csv", errors)
 
     route_keys = {}
+    route_lines = {}
     for lineno, row in route_rows:
         prod, seq, rec = row.get("product", ""), row.get("seq", ""), row.get("recipe", "")
         k = (prod, seq)
@@ -355,6 +356,7 @@ def load_model(config_dir):
             errors.append(_err("routes.csv", lineno, "seq", "整数ではありません", seq))
             continue
         m.products[prod].route.append(Step(sq, row.get("step_name", ""), m.recipes[rec]))
+        route_lines[(prod, sq)] = lineno
     for prod in m.products.values():
         prod.route.sort(key=lambda s: s.seq)
 
@@ -447,6 +449,7 @@ def load_model(config_dir):
             due_date=_num(row, "due_date", "release.csv", errors, None)))
     _dup_check(rel_rows, ["lot_id"], "release.csv", errors)
 
+    area_lines = {}
     for lineno, row in area_rows:
         rh = _num(row, "agv_return_home", "areas.csv", errors, 1,
                   integer=True)
@@ -461,10 +464,18 @@ def load_model(config_dir):
                  agv_unload_time=_num(row, "agv_unload_time", "areas.csv", errors, 0.0) or 0.0,
                  agv_return_home=int(rh))
         m.areas[a.name] = a
-        if a.agv_count < 1:
-            errors.append(_err("areas.csv", lineno, "agv_count", "1 以上が必要です", a.agv_count))
+        area_lines[a.name] = lineno
+        if a.agv_count == 0:
+            no_agv_eq = sorted(e.equip_id for e in m.equipments.values()
+                               if e.area == a.name)
+            if no_agv_eq:
+                warnings.append(
+                    "areas.csv:%d: エリア %s は AGV 0 台のため設備 %s "
+                    "は搬送できません"
+                    % (lineno, a.name, ", ".join(no_agv_eq)))
     _dup_check(area_rows, ["area"], "areas.csv", errors)
 
+    st_lines = {}
     for lineno, row in st_rows:
         s = StockerCfg(
             stocker_id=row.get("stocker_id", ""),
@@ -474,6 +485,7 @@ def load_model(config_dir):
             out_ports=int(_num(row, "out_ports", "stockers.csv", errors, 1, integer=True) or 1),
             port_time=_num(row, "port_time", "stockers.csv", errors, 0.0) or 0.0)
         m.stockers[s.stocker_id] = s
+        st_lines[s.stocker_id] = lineno
         if s.capacity < 1:
             errors.append(_err("stockers.csv", lineno, "capacity", "1 以上が必要です", s.capacity))
         if s.in_ports < 1 or s.out_ports < 1:
@@ -481,6 +493,7 @@ def load_model(config_dir):
                                "1 以上が必要です", "%s/%s" % (s.in_ports, s.out_ports)))
     _dup_check(st_rows, ["stocker_id"], "stockers.csv", errors)
 
+    cl_seen = set()
     for lineno, row in cl_rows:
         ttn = _num(row, "time_to_next", "cleanliner.csv", errors, 0.0, positive=True) or 0.0
         try:
@@ -490,16 +503,28 @@ def load_model(config_dir):
                                row.get("seq", "")))
             continue
         sid = row.get("stocker_id", "")
+        if sid not in m.stockers:
+            errors.append(_err("cleanliner.csv", lineno, "stocker_id",
+                               "stockers.csv に無いストッカーです", sid))
+        elif sid in cl_seen:
+            errors.append(_err("cleanliner.csv", lineno, "stocker_id",
+                               "駅が重複しています", sid))
+        cl_seen.add(sid)
         m.cl_stations.append((sq, sid, ttn))
     m.cl_stations.sort(key=lambda x: x[0])
     _dup_check(cl_rows, ["seq"], "cleanliner.csv", errors)
 
-    _cross_validate(m, errors)
+    _cross_validate(m, errors, warnings,
+                    {"area": area_lines, "stocker": st_lines,
+                     "route": route_lines})
     m.warnings = warnings
     return m, errors, warnings
 
 
-def _cross_validate(m, errors):
+def _cross_validate(m, errors, warnings, lines):
+    """整合性検証。方針: 存在しない ID への参照(タイプミス等)はエラー、
+    構造的な未接続(要素は存在するがまだ接続されていない=到達不可)は警告。
+    lines: {area|stocker|route: {キー: 行番号}} 警告・エラーの行番号付け用。"""
     p = m.params
     for r in m.recipes.values():
         if r.tool_group not in m.tool_groups:
@@ -509,30 +534,56 @@ def _cross_validate(m, errors):
         if e.area not in m.areas:
             errors.append("equipments.csv: 設備 %r の area %r は areas.csv にありません"
                           % (e.equip_id, e.area))
-    # 各レシピに処理可能な設備が 1 台以上
+    # 「到達可能なエリア」= ストッカーがあり、そのストッカーが CL 駅
+    # (または投入ストッカー)で、AGV が 1 台以上あるエリア。
+    cl_sids = set(sid for _, sid, _ in m.cl_stations)
+
+    def reachable(area):
+        a = m.areas.get(area)
+        st = m.stocker_of_area(area)
+        return (a is not None and a.agv_count >= 1 and st is not None
+                and (st.stocker_id in cl_sids
+                     or st.stocker_id == p.release_stocker))
+
+    # 各レシピに、到達可能なエリアにある処理可能な設備が 1 台以上(警告)
     for prod in m.products.values():
         for st in prod.route:
             r = st.recipe
             ok = any(e.tool_group == r.tool_group and e.can_process(r)
+                     and reachable(e.area)
                      for e in m.equipments.values())
             if not ok:
-                errors.append("routes.csv: 機種 %r 工程 %r (レシピ %r) を処理できる設備がありません"
-                              % (prod.name, st.seq, r.recipe))
-    # 各エリアにストッカーが 1 基
+                warnings.append(
+                    "routes.csv:%s: 機種 %r 工程 %r (レシピ %r) を処理できる"
+                    "到達可能な設備がありません(この工程のロットは滞留します)"
+                    % (lines["route"].get((prod.name, st.seq), "-"),
+                       prod.name, st.seq, r.recipe))
+    # 各エリアにストッカーが 1 基。0 基は未接続=警告、2 基以上は
+    # 「エリアのストッカーが一意に決まらない」のでエラーのまま。
     for a in m.areas.values():
         n = sum(1 for s in m.stockers.values() if s.area == a.name)
-        if n != 1:
+        if n == 0:
+            eqs = sorted(e.equip_id for e in m.equipments.values()
+                         if e.area == a.name)
+            warnings.append(
+                "areas.csv:%s: エリア %r にストッカーがありません"
+                "(このエリアへは搬送・格納できません)%s"
+                % (lines["area"].get(a.name, "-"), a.name,
+                   ("(設備 %s)" % ", ".join(eqs)) if eqs else ""))
+        elif n > 1:
             errors.append("stockers.csv: エリア %r のストッカーが %d 基です(1 基必要)"
                           % (a.name, n))
     for s in m.stockers.values():
         if s.area not in m.areas:
             errors.append("stockers.csv: ストッカー %r の area %r は areas.csv にありません"
                           % (s.stocker_id, s.area))
-    # cleanliner の駅とストッカーの一致
-    st_in_cl = [sid for _, sid, _ in m.cl_stations]
-    if sorted(st_in_cl) != sorted(m.stockers.keys()):
-        errors.append("cleanliner.csv: 駅 %s と stockers.csv %s が一致しません"
-                      % (sorted(st_in_cl), sorted(m.stockers.keys())))
+        elif s.stocker_id not in cl_sids:
+            warnings.append(
+                "stockers.csv:%s: ストッカー %r は cleanliner.csv に駅がありません"
+                "(CL では到達・出発できません)"
+                % (lines["stocker"].get(s.stocker_id, "-"), s.stocker_id))
+    # cleanliner 側の参照切れ(存在しない stocker_id)と駅重複は
+    # 行ループでエラー検出済み。
     if p.release_stocker and p.release_stocker not in m.stockers:
         errors.append("sim.csv: release_stocker %r は stockers.csv にありません"
                       % p.release_stocker)

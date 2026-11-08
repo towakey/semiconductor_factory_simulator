@@ -261,10 +261,12 @@ setups.csv        ★tool_group, ★from_recipe, ★to_recipe, ★setup_time
 release.csv       ★lot_id, ★product, ★release_time, priority, due_date
 
 areas.csv         ★area, ★agv_count, agv_load_time, agv_unload_time, agv_return_home(0/1,既定1=タスク終了後ストッカーへ空走で戻る)
-                    agv_count: エリア専属 AGV 台数(1 以上)
+                    agv_count: エリア専属 AGV 台数(0 以上。0 の場合そのエリアの設備には搬送できない。
+                               エリアに設備があると検証時に警告)
 
 stockers.csv      ★stocker_id, ★area, ★capacity, in_ports, out_ports, port_time
-                    1 エリアに 1 基。in_ports/out_ports 既定 1、port_time 既定 0
+                    1 エリアに 1 基(0 基は検証時警告=そのエリアは到達不可、
+                    2 基以上はエラー)。in_ports/out_ports 既定 1、port_time 既定 0
 
 cleanliner.csv    ★seq, ★stocker_id, ★time_to_next
                     seq 昇順にループを構成(最後の駅の次は seq 最小の駅へ戻る)
@@ -287,15 +289,21 @@ DEVICE_A,20,R_FURN1,酸化
 DEVICE_A,30,R_ETCH1,エッチ
 ```
 
-検証(起動時、全件まとめて報告し、1 件でもあれば終了コード 2):
+検証(起動時、全件まとめて報告し、エラーが 1 件でもあれば終了コード 2):
 - 必須列の欠落、数値でない値、負値、不正な列挙値(`time_unit`、`dist`、ルール名)。
 - 参照整合性: `routes.recipe` が `recipes` に存在、`recipes.tool_group` が `tool_groups` に存在、設備のツールグループが存在、`qualifications`/`setups` の設備・レシピが存在。
 - 主キー重複、`routes` の `seq` 重複。
-- 各レシピに処理可能な設備が 1 台以上あること(なければ詰まるため)。
 - `batch_min` > `batch_max` などの矛盾。
-- 搬送: 設備の `area` が `areas` に存在、各エリアにストッカーが 1 基だけ存在、`cleanliner.csv` の駅が `stockers` と過不足なく一致(全ストッカーが 1 回ずつ登場)、`release_stocker` が存在、`agv_count` ≥ 1、`cl_carriers` ≥ 1、`cl_slots` ≥ 1、`time_to_next` > 0、`capacity` ≥ 1。
-- 各レシピのツールグループが、CL で到達可能なエリア(=全エリア)に最低 1 台あること。
+- 搬送: 設備の `area` が `areas` に存在、`release_stocker` が存在、`agv_count` ≥ 0、`cl_carriers` ≥ 1、`cl_slots` ≥ 1、`time_to_next` > 0、`capacity` ≥ 1。
+- `cleanliner.csv` の駅が `stockers` に存在すること(存在しない `stocker_id` はエラー)、駅の重複はエラー。
 - エラーメッセージは「ファイル名・行番号・列名・内容」を含める。
+
+方針: **存在しない ID への参照(タイポ等)はエラーのまま。構造的な未接続(要素は存在するがまだ接続されていない状態)は警告に下げ、保存・実行を許す。** 未接続部分は実行時に到達不可となり、該当工程のロットは現在のストッカーで滞留するだけでクラッシュしない(行き先選択でも到達不可のエリアは候補から除外する)。警告になるもの:
+
+- エリアにストッカーが 0 基(そのエリアへは搬送・格納できない)。2 基以上は「エリアのストッカーが一意に決まらない」ため従来どおりエラー。
+- `stockers.csv` のストッカーが `cleanliner.csv` に駅を持たない(CL で到達・出発できない)。
+- 各レシピに「到達可能なエリア(ストッカー+CL 駅+AGV ≥1 の経路)」にある処理可能な設備が 1 台以上あること。無い場合は警告(その工程のロットは滞留する)。従来の「全エリアに最低 1 台」検証を到達可能性ベースに読み替えたもの。
+- `agv_count` = 0 のエリアに設備がある(5.5.4、前述の警告)。
 
 ### 6.2 CLI
 
@@ -335,7 +343,7 @@ python -m fabsim validate --config-dir model/
 - 稼働率 = BUSY 時間 / (総時間 − PM − DOWN)と、BUSY 時間 / 総時間の両方を出力する。
 - Little の法則(WIP ≒ スループット × サイクルタイム)で整合性を確認する。
 - 搬送時間比率 = (agv_wait + agv_move + cl_wait + cl_move + port_wait) / サイクルタイム。
-- AGV 稼働率 = (空走 + 実走時間) / (総時間 × AGV 台数)。
+- AGV 稼働率 = (空走 + 実走時間) / (総時間 × AGV 台数)。AGV 0 台のエリアは 0 とする。
 - CL キャリア稼働率 = 積載スロット時間 / (総時間 × キャリア台数 × スロット数)。
 - ストッカー満杯率 = 格納数 = capacity の時間 / 総時間。
 
@@ -643,6 +651,8 @@ layout.csv   ★node_type, ★node_id, ★x, ★y, w, h
 - 列メタデータは `config.py` の `CSV_SPECS`/`SIM_SPECS` が単一の情報源(必須/型/enum/参照先/既定値/ラベル)。enum・参照列は select、数値は number。
 - ロック `.model.lock`(O_EXCL・180秒・60秒ハートビート。レイアウトロックとは別)、リビジョン=編集対象 CSV 全体の SHA-1 先頭16桁、履歴 `model_history/` 20世代。
 - 保存はロック所有・base_revision 一致(409)・編集権限・`config.load_model` の全件検証を満たす場合のみ。警告のみなら保存可。一時ディレクトリに全 CSV を書いて検証後、各ファイルを tempfile+os.replace で置換。空になった任意ファイル(qualifications/setups/release)は削除。# コメント行は保存で失われる(UI に明記)。
+- 主キー列(`ref` の参照先である列: equipments.csv の equip_id、stockers.csv の stocker_id、areas.csv の area、tool_groups.csv の tool_group、recipes.csv の recipe、products.csv の product)を編集コミットすると、クライアント側で全ファイルの参照列を旧値→新値に一括置換する(カスケードリネーム)。対象は CSV_SPECS/SIM_SPECS の ref メタデータから導出し、sim.csv の `release_stocker` のような ref 値も含む。置換件数はステータスに「参照 N 箇所を更新」と表示し、リネーム+カスケードは Undo/Redo の 1 ステップに含める(スナップショットは files とリネーム履歴を抱き合わせる)。他行の主キーと重複する新名はアラートして差し戻す(空への変更は許し、検証で必須エラーにする)。
+- リネーム履歴は `{kind: 主キー列のファイル名, col: 主キー列名, old, new}` のリストとして保持し、`model_save` の `renames` パラメータで送る(保存成功・破棄でクリア)。サーバー側は kind/col を参照先の組合せに限定し、old/new は `^[A-Za-z0-9_:-]{1,64}$`・200 件までを検証する。モデル CSV の保存・検証が成功したあと、`layout.csv` が存在すれば node_id を置換して書き戻す: kind=equipments.csv なら node_type=equip の node_id と agv_point の「old:k」→「new:k」接頭辞、kind=stockers.csv なら stocker と cl_point の接頭辞、kind=areas.csv なら area。その他の kind は layout.csv に影響しない。置換は記録順に適用し、件数を `layout_renamed`・更新有無を `layout_updated` で返す(`.layout.lock` 中でも実行する=座標の参照整合を保つため)。
 - 新規モデルは既存モデルの複製(model_clone)で作成し、ロック・履歴ファイルは複製しない。
 
 ### 12.7 結果表示画面
@@ -705,7 +715,7 @@ layout.csv   ★node_type, ★node_id, ★x, ★y, w, h
 | POST | `model_validate` | model, files | 保存せず config 検証のみ実行し、エラー/警告一覧を返す |
 | POST | `model_lock` | model, client_id | モデル編集ロックの取得/更新(`.model.lock`、180秒) |
 | POST | `model_unlock` | model, client_id | 自分のモデル編集ロックを解放 |
-| POST | `model_save` | model, client_id, base_revision, files | 検証・ロック・リビジョン確認のうえ CSV を保存し新 `revision` を返す(12.6) |
+| POST | `model_save` | model, client_id, base_revision, files, [renames] | 検証・ロック・リビジョン確認のうえ CSV を保存し新 `revision` を返す(12.6)。`renames` は主キーリネーム `{kind,col,old,new}` のリストで、保存成功後に layout.csv の node_id へも適用し `layout_renamed`/`layout_updated` を返す |
 | POST | `model_clone` | model, new_name | モデルを別名で複製(既存名は 409) |
 
 - 応答の共通形式: 成功時 `{"ok":true, ...}`、失敗時 `{"ok":false,"error":"<コード>"}` と適切な HTTP ステータス(400/403/404/409/500)。
@@ -721,6 +731,7 @@ layout.csv   ★node_type, ★node_id, ★x, ★y, w, h
 - DB は `file:...?mode=ro` の URI(`sqlite3.connect(uri=True)`)で開き、SQL は固定文のみ使用する。ユーザー入力は必ずプレースホルダーに渡す。
 - `start`/`cancel` は POST のみ。CSRF 対策として、カスタムヘッダー `X-Requested-With: fabsim` を必須にする。`Content-Type` は `application/json` または `application/x-www-form-urlencoded` に限定する。
 - レイアウト編集 API(`layout_*`)は、書込みを `data/models/<model>/` 配下の所定ファイルに限定する。`client_id` は `^[0-9a-f]{16,32}$`。`layout_save` は本文 256 KB 以下、ロック所有・リビジョン一致・編集権限・内容検証(12.5.6)のすべてを満たす場合のみ書き込む。
+- `model_save` の `renames` は `{kind,col,old,new}` のリストで 200 件まで。kind/col は ref 参照先となる既知の組合せのみ、old/new は `^[A-Za-z0-9_:-]{1,64}$` を満たすものに限定する(12.6)。
 - `layout_lock` / `layout_save` の応答では、ロック所有者名(`REMOTE_USER`)以外の内部情報(パス等)を返さない。
 - 同時実行数の上限(既定 2)を超える `start` は 409。上限は `data/web_config.json` で変更できる。
 - エラー詳細(スタックトレース、パス)はクライアントに返さず、`data/api_error.log` に記録する。`cgitb` は有効化しない。

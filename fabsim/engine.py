@@ -54,8 +54,10 @@ class Simulator(object):
         self.stocker_by_area = {s.area: s for s in self.stockers.values()}
         self.fleets = {}
         for a in model.areas.values():
-            st = self.stocker_by_area[a.name]
-            self.fleets[a.name] = AgvFleet(a, st.stocker_id,
+            # ストッカー無しエリアも許容(検証では警告): そのエリアには
+            # 搬送タスクが来ないので fleet の stocker_id は None でよい
+            st = self.stocker_by_area.get(a.name)
+            self.fleets[a.name] = AgvFleet(a, st.stocker_id if st else None,
                                          out_first=bool(self.p.agv_out_first))
         self.equip_agv_time = {eid: e.agv_time
                                for eid, e in model.equipments.items()}
@@ -275,10 +277,30 @@ class Simulator(object):
                                   step.recipe.recipe, now)
         self._req_dispatch(tg, st.area)
 
+    def _area_ok(self, area, cur_area):
+        """cur_area のストッカーに居るロットが area の設備へ到達可能か。
+        同一エリアは AGV のみ必要。他エリアは「現在地のストッカーが CL 駅」
+        かつ「向こう側にストッカー+CL 駅+AGV」が必要。"""
+        a = self.model.areas.get(area)
+        if a is None:
+            return False
+        if area == cur_area:
+            return a.agv_count >= 1
+        cur_st = self.stocker_by_area.get(cur_area)
+        if cur_st is None or cur_st.stocker_id not in self.cl.station_idx:
+            return False                       # 現在地から CL で出られない
+        st = self.stocker_by_area.get(area)
+        return (st is not None
+                and st.stocker_id in self.cl.station_idx
+                and a.agv_count >= 1)
+
     def _select_dest(self, lot, cur_area):
         step = lot.next_step()
         tg = step.recipe.tool_group
-        cands = self.model.areas_with_group(tg)
+        # 到達不可なエリア(ストッカー無し・CL 駅無し・AGV 0 台)は候補から除く。
+        # 全候補が到達不可なら現在エリアのストッカーに滞留させる。
+        cands = [a for a in self.model.areas_with_group(tg)
+                 if self._area_ok(a, cur_area)]
         if not cands:
             return cur_area
         if self.p.area_select == "NEAREST":

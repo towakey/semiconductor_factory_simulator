@@ -74,7 +74,8 @@ class Stats(object):
                               float(self.total_completed)))
         for area, fleet in sorted(sim.fleets.items()):
             busy = sum(a.empty_time + a.loaded_time for a in fleet.agvs)
-            util = busy / (t * len(fleet.agvs)) if t > 0 else 0.0
+            util = busy / (t * len(fleet.agvs)) \
+                if t > 0 and fleet.agvs else 0.0
             self.kpi_rows.append((round(t, 3), "agv_util", area,
                                   round(util, 6)))
         tot_e = sum(a.empty_time + a.loaded_time

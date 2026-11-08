@@ -14,4 +14,5 @@
 
 ## ルール
 - 検証用の変更は `data/models/small_fab` を `samples/small_fab` と同一に戻すこと。
+- `data/models/default` はユーザーが編集中の作業モデル。検証後に戻したり削除したりしないこと。
 - `data/runs` の検証 run は最大3個まで残してよい。

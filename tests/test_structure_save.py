@@ -133,7 +133,9 @@ class StructSaveTest(unittest.TestCase):
     def test_validation_400_unchanged(self):
         nodes, m = self._nodes()
         st = self._struct()
-        st["equipments.csv"]["rows"] = []         # 設備ゼロ → 検証エラー
+        eq = st["equipments.csv"]
+        # 存在しないエリアへの参照は従来どおり検証エラー
+        eq["rows"][0][eq["cols"].index("area")] = "NOPE"
         rev_l = layoutstore.revision(self.mdir)
         rev_m = modelstore.revision(self.mdir)
         st_code, r = self._save(nodes, st)

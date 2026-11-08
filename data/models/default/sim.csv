@@ -1,0 +1,17 @@
+key,value
+duration,20160
+warmup,0
+seed,1
+dispatch_rule,FIFO
+release_mode,fixed
+lots_per_day,10
+release_control,fixed
+wip_limit,0
+release_stocker,S1
+area_select,LEAST_LOADED
+agv_out_first,1
+cl_carriers,4
+cl_slots,2
+cl_load_time,2
+cl_unload_time,2
+failure_policy,resume
