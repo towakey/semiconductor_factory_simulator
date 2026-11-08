@@ -147,7 +147,7 @@ function stateAt(t) {
   for (const r of d.agv_moves.rows) am.push(r);
   for (const r of d.cl_rides.rows)
     if (r[6] <= t && r[7] > t) rides.push(r);
-  return { es, sl, am, rides };
+  return { es, sl, am, rides, pl };
 }
 const nodePos = {};   // id -> {x,y,w,h}
 // 折れ線補助: 弧長比率での補間
@@ -307,7 +307,7 @@ function draw() {
       ctx.fillStyle = "#003";
       ctx.fillText(String(row[2]).split(",")[0], sx(e.x) + 2, sy(e.y) + 14);
     }
-    // ポート(下辺の小枠): 占有=処理中は状態色/待機は水色
+    // ポート(下辺の小枠): 処理中=黄 / 待機=水色 / 空き=黒
     const pw = e.w || EQUIP_W, ph = e.h || EQUIP_H;
     const np = Math.max(1, e.ports || 1);
     const occ = (S.pl && S.pl[e.equip_id]) || [];
@@ -319,7 +319,7 @@ function draw() {
       const processing = occupied &&
         row && row[2] && row[2].split(",").includes(occ[pi]);
       ctx.fillStyle = occupied
-        ? (processing ? (STATE_COLORS[state] || "#4caf50") : "#4fc3f7")
+        ? (processing ? "#ffb300" : "#4fc3f7")
         : "#1a1a1a";
       ctx.fillRect(px, py, sw(slotW), sw(4));
       ctx.strokeStyle = "#666";
@@ -381,20 +381,20 @@ function draw() {
     if (mv && mv[5]) { ctx.fillStyle = "#ffd"; ctx.font = "8px sans-serif";
       ctx.fillText(mv[5], ax + 6, ay - 6); }
   });
-  // CL キャリア
+  // CL キャリア(ロット積載中のみ表示)
   const cl = V.lay.cl;
   for (let k = 0; k < cl.carriers; k++) {
+    const loads = S.rides.filter(r => r[1] === k);
+    if (!loads.length) continue;
     const p = carrierPos(k, t);
     ctx.beginPath(); ctx.arc(sx(p.x), sy(p.y), 7, 0, 7);
     ctx.fillStyle = "#26a69a"; ctx.fill();
     ctx.strokeStyle = V.sel === "cl" + k ? "#fff" : "#135";
     ctx.stroke();
-    let j = 0;
-    for (const r of S.rides) {
-      if (r[1] !== k) continue;
+    loads.forEach((r, j) => {
       ctx.beginPath(); ctx.arc(sx(p.x) - 4 + 5 * j, sy(p.y), 2, 0, 7);
-      ctx.fillStyle = "#ff5252"; ctx.fill(); j++;
-    }
+      ctx.fillStyle = "#ff5252"; ctx.fill();
+    });
   }
   // 時刻
   $("clock").textContent =
