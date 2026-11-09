@@ -64,6 +64,8 @@ $("btnRun").onclick = async () => {
   $("btnCancel").disabled = false;
   $("status").textContent = "running " + r.run_id;
   V.live = true;
+  V.lay = null;
+  loadRun(r.run_id);
 };
 $("btnCancel").onclick = async () => {
   await api("cancel", {}, "POST", { run: $("run").value });
