@@ -174,6 +174,27 @@ function polyPoint(poly, f) {
   }
   return poly[poly.length - 1];
 }
+// 折れ線に沿って進行方向の矢印を描く(画面座標で呼ぶ sx/sy を渡す)
+function clArrows(ctx, poly, sx, sy) {
+  const { total } = polyLenSegs(poly);
+  if (total < 1) return;
+  const n = Math.max(1, Math.min(6, Math.round(total / 140)));
+  const d = Math.min(0.02, 4 / total);
+  for (let j = 0; j < n; j++) {
+    const f = (j + 1) / (n + 1);
+    const p = polyPoint(poly, f), a = polyPoint(poly, f - d),
+          b = polyPoint(poly, f + d);
+    const ang = Math.atan2(sy(b.y) - sy(a.y), sx(b.x) - sx(a.x));
+    const cx = sx(p.x), cy = sy(p.y), L = 13;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(ang) * L, cy + Math.sin(ang) * L);
+    ctx.lineTo(cx + Math.cos(ang + 2.6) * L * 0.5,
+               cy + Math.sin(ang + 2.6) * L * 0.5);
+    ctx.lineTo(cx + Math.cos(ang - 2.6) * L * 0.5,
+               cy + Math.sin(ang - 2.6) * L * 0.5);
+    ctx.closePath(); ctx.fill();
+  }
+}
 function clPoly(sid) {           // 駅 i → 駅 i+1 の折れ線
   const st = V.lay.cl_stations;
   const a = nodePos[sid],
@@ -285,6 +306,9 @@ function draw() {
                           : ctx.lineTo(sx(p.x), sy(p.y)));
   });
   ctx.stroke();
+  ctx.fillStyle = "#8fa3b8";
+  for (const s of st)
+    clArrows(ctx, clPoly(s.stocker_id), sx, sy);
   // エリア
   ctx.textBaseline = "top";
   for (const a of V.lay.areas) {

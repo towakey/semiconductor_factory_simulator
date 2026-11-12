@@ -146,6 +146,13 @@ function leDraw() {
                           : ctx.lineTo(lsx(p.x), lsy(p.y)));
   });
   ctx.stroke();
+  ctx.fillStyle = "#8fa3b8";
+  LE.clStations.forEach((s, i) => {
+    const a = LE.nodes["stocker/" + s.stocker_id],
+          b = LE.nodes["stocker/" + LE.clStations[
+            (i + 1) % LE.clStations.length].stocker_id];
+    if (a && b) clArrows(ctx, leClPoly(s.stocker_id, a, b), lsx, lsy);
+  });
   // AGV 経路(点線)
   ctx.strokeStyle = "#4a5563"; ctx.lineWidth = 1;
   ctx.setLineDash([3, 3]);
