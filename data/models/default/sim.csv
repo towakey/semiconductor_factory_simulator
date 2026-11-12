@@ -7,7 +7,7 @@ release_mode,fixed
 lots_per_day,10
 release_control,fixed
 wip_limit,0
-release_stocker,ST07
+release_stocker,ST08
 area_select,LEAST_LOADED
 agv_out_first,1
 cl_carriers,4
